@@ -1,6 +1,6 @@
 # Rqlink
 
-Rqlink is a lightweight, intuitive, **Prisma-style ORM** client for [rqlite](https://github.com/rqlite/rqlite). It provides a type-safe(ish) JavaScript API to interact with your distributed SQLite database, handling connections, query building, and **safe schema migrations** automatically.
+Rqlink is a lightweight, intuitive, **Prisma-style** client for [rqlite](https://github.com/rqlite/rqlite). It provides a type-safe(ish) JavaScript API to interact with your distributed SQLite database, handling connections, query building, and **safe schema migrations** automatically.
 
 ## Features
 
