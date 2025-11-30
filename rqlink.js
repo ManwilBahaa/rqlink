@@ -1,6 +1,6 @@
 // rqliteClient.js
 // rqliteClient.js
-import { schema } from "./schema.js";
+// rqlink.js
 
 /**
  * Lightweight Prisma-style rqlite client
@@ -348,6 +348,10 @@ function buildModel(tableName, cfg) {
      * Note: SQLite/rqlite doesn't support UPDATE ... RETURNING easily in all versions/modes,
      * so we attempt to fetch the updated record if a PK is provided.
      */
+    /**
+     * Updates records matching criteria.
+     * Uses UPDATE ... RETURNING * to get the updated records in a single round-trip.
+     */
     async update({ where, data, select }) {
       if (!where || Object.keys(where).length === 0) throw new Error("update requires where");
       if (!data || Object.keys(data).length === 0) throw new Error("update requires data");
@@ -363,19 +367,34 @@ function buildModel(tableName, cfg) {
       const params = { ...whereParams };
       for (const c of setCols) params[`set_${c}`] = data[c];
 
-      const sql = `UPDATE ${tableName} SET ${setClause} WHERE ${whereClause};`;
-      await executeSQL(port, sql, params);
+      // OPTIMIZATION: Use RETURNING * to fetch updated rows immediately
+      const sql = `UPDATE ${tableName} SET ${setClause} WHERE ${whereClause} RETURNING *;`;
 
-      // Return updated record(s) - tricky in SQLite/rqlite without RETURNING
-      // We'll try to find the first match of the WHERE clause *after* update if PK is involved
-      // Ideally, user provides PK in where.
-      if (pk && where[pk]) {
-        return this.findUnique({ where: { [pk]: where[pk] }, select });
+      const res = await executeSQL(port, sql, params);
+
+      // Parse result
+      const r = res.results?.[0] || {};
+      const resCols = r.columns || [];
+      const resRows = r.values || [];
+
+      if (resRows.length > 0) {
+        // Return the first updated record (Prisma style usually returns one)
+        // If multiple were updated, this returns the first one.
+        const row = resRows[0];
+        const obj = {};
+        resCols.forEach((c, i) => obj[c] = row[i]);
+
+        if (select) {
+          const filtered = {};
+          for (const k of Object.keys(select)) {
+            if (select[k]) filtered[k] = obj[k];
+          }
+          return filtered;
+        }
+        return obj;
       }
 
-      // If we can't deterministically find it, return count or true? 
-      // Prisma returns the object. We'll try to findFirst with the same where clause
-      return this.findFirst({ where, select });
+      return null; // No record updated
     },
 
     /**
@@ -418,38 +437,20 @@ function columnDefSQL(name, def) {
 }
 
 /**
- * Creates a client instance for a given schema.
- * Useful for testing or multi-tenant scenarios.
- */
-export function createClient(schemaDef) {
-  validateSchema(schemaDef);
-  const client = {};
-  for (const t of Object.keys(schemaDef)) {
-    client[t] = buildModel(t, schemaDef[t]);
-  }
-  return client;
-}
-
-/**
- * Default database client instance using the global schema.
- */
-export const db = createClient(schema);
-
-/**
  * Initializes the database tables based on the schema.
  * Performs SAFE MIGRATIONS:
  * - Checks if tables exist.
  * - If table exists, checks for missing columns and adds them (ALTER TABLE).
  * - Creates indexes.
  * 
- * @param {Object} options - { verbose: boolean, schema: object }
+ * @param {Object} schemaDef - The schema object.
+ * @param {boolean} verbose - If true, logs SQL commands.
  */
-export async function initDB({ verbose = false, schema: schemaOverride = null } = {}) {
+async function initDBSchema(schemaDef, verbose = false) {
   if (verbose) configure({ verbose: true });
-  const targetSchema = schemaOverride || schema;
-  validateSchema(targetSchema);
+  validateSchema(schemaDef);
 
-  for (const [tableName, cfg] of Object.entries(targetSchema)) {
+  for (const [tableName, cfg] of Object.entries(schemaDef)) {
     const port = cfg.port;
     const colDefs = Object.entries(cfg.fields).map(([col, def]) => columnDefSQL(col, def));
     const createSQL = `CREATE TABLE IF NOT EXISTS ${tableName} (${colDefs.join(", ")});`;
@@ -499,14 +500,41 @@ export async function initDB({ verbose = false, schema: schemaOverride = null } 
 /**
  * Drops all tables in the schema.
  * WARNING: DESTRUCTIVE OPERATION.
+ * @param {Object} schemaDef - The schema object.
+ * @param {boolean} verbose - If true, logs SQL commands.
  */
-export async function dropDB({ verbose = false } = {}) {
+async function dropDBSchema(schemaDef, verbose = false) {
   if (verbose) console.log("Dropping all tables...");
-  for (const [tableName, cfg] of Object.entries(schema)) {
+  for (const [tableName, cfg] of Object.entries(schemaDef)) {
     const port = cfg.port;
     await executeSQL(port, `DROP TABLE IF EXISTS ${tableName};`);
   }
   return true;
 }
 
-export default { initDB, dropDB, db, configure, createClient, executeSQL, querySQL };
+/**
+ * Creates a client instance for a given schema.
+ * Returns an object with:
+ * - db: The query builder interface.
+ * - initDB: Function to initialize the DB for this schema.
+ * - dropDB: Function to drop the DB for this schema.
+ * 
+ * @param {Object} schemaDef - The schema definition object.
+ */
+export function createClient(schemaDef) {
+  validateSchema(schemaDef);
+
+  // Build the DB interface
+  const dbInterface = {};
+  for (const t of Object.keys(schemaDef)) {
+    dbInterface[t] = buildModel(t, schemaDef[t]);
+  }
+
+  return {
+    db: dbInterface,
+    initDB: (opts = {}) => initDBSchema(schemaDef, opts.verbose),
+    dropDB: (opts = {}) => dropDBSchema(schemaDef, opts.verbose)
+  };
+}
+
+export default { configure, createClient, executeSQL, querySQL };

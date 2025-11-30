@@ -8,6 +8,7 @@ Rqlink is a lightweight, intuitive, **Prisma-style ORM** client for [rqlite](htt
 - 🛡️ **Safe Migrations**: `initDB()` automatically creates tables and adds missing columns without data loss.
 - 🔍 **Powerful Filtering**: Support for `gt`, `lt`, `contains`, `startsWith`, `in`, `OR`, `NOT`, and more.
 - ⚡ **Multi-Port Support**: Easily manage sharded databases across different rqlite ports.
+- 🔑 **Composite Keys**: Support for composite unique constraints (e.g., `(user_id, post_id)`).
 - 📦 **Zero Dependencies**: Built on native `fetch`.
 
 ---
@@ -26,129 +27,88 @@ bun add rqlink
 
 ### 1. Define your Schema
 
-Create a `schema.js` file to define your database structure. Rqlink uses a simple JavaScript object for schema definition.
+Create a `schema.js` file to define your database structure.
 
 ```javascript
 // schema.js
 export const schema = {
-  // Table Name
+  // Standard Table with Primary Key
   users: {
     port: 4001, // rqlite port for this table
-    primaryKey: "id",
+    primaryKey: "id", // Optional: Helps optimize updates
     fields: {
-      // Column definitions
       id: { type: "INTEGER", pk: true, autoIncrement: true },
       email: { type: "TEXT", notNull: true },
       name: { type: "TEXT" },
       age: { type: "INTEGER" },
-      is_active: { type: "INTEGER", default: 1 }, // SQLite uses 0/1 for booleans
+      is_active: { type: "INTEGER", default: 1 },
       created_at: { type: "TEXT", default: "CURRENT_TIMESTAMP" }
     },
     indexes: [
-      { name: "uq_users_email", columns: ["email"], unique: true },
-      { columns: ["name"] } // Simple index
+      { name: "uq_users_email", columns: ["email"], unique: true }
     ]
   },
-  posts: {
+  
+  // Table with Composite Key (No single PK)
+  likes: {
     port: 4001,
-    primaryKey: "id",
     fields: {
-      id: { type: "TEXT", pk: true },
       user_id: { type: "INTEGER" },
-      title: { type: "TEXT" },
-      content: { type: "TEXT" }
-    }
+      post_id: { type: "INTEGER" },
+      created_at: { type: "TEXT", default: "CURRENT_TIMESTAMP" }
+    },
+    indexes: [
+      // Composite Unique Constraint acts as the "Key"
+      { name: "uq_likes", columns: ["user_id", "post_id"], unique: true }
+    ]
   }
 };
 ```
 
-### 2. Initialize the Database
+### 2. Initialize the Client & Database
 
-Before using the client, run `initDB()`. This function is **safe to run repeatedly**.
-
-> **🛡️ Safety Note:** `initDB` checks your schema against the actual database. If you add new fields to your `schema.js`, `initDB` will automatically `ALTER TABLE` to add them. **It will NEVER delete columns or drop tables**, ensuring your data is safe.
+Import `createClient` and your schema to start.
 
 ```javascript
-import { initDB } from "rqlink";
+import { createClient } from "rqlink";
+import { schema } from "./schema.js";
+
+// Create the client instance
+const { db, initDB } = createClient(schema);
 
 async function main() {
-  await initDB({ verbose: true }); // verbose logs SQL commands
-  console.log("Database initialized and up-to-date!");
+  // Initialize tables (Safe Migration)
+  await initDB({ verbose: true });
+  console.log("Database initialized!");
+
+  // Use the client
+  const user = await db.users.create({
+    data: {
+      name: "Alice",
+      email: "alice@example.com",
+      age: 25
+    }
+  });
+  console.log("Created:", user);
 }
 
 main();
 ```
 
-### 3. Use the Client
-
-Import `db` to start querying.
-
-```javascript
-import { db } from "rqlink";
-
-// Create a user
-const user = await db.users.create({
-  data: {
-    name: "Alice",
-    email: "alice@example.com",
-    age: 25
-  }
-});
-// Returns: { id: 1, name: "Alice", email: "alice@example.com", age: 25, is_active: 1, created_at: "..." }
-
-// Find users
-const users = await db.users.findMany({
-  where: {
-    age: { gt: 20 },
-    name: { startsWith: "A" }
-  },
-  orderBy: { age: "desc" }
-});
-// Returns: [ { id: 1, name: "Alice", ... }, ... ]
-```
-
----
-
-## Schema Definition Guide
-
-The schema is the heart of Rqlink. Here is a breakdown of the field options.
-
-### Field Types & Variants
-
-SQLite has a dynamic type system, but Rqlink enforces structure.
-
-| Type | Description | JavaScript Equivalent |
-| :--- | :--- | :--- |
-| `INTEGER` | Whole numbers. Used for IDs, counts, booleans (0/1). | `number` |
-| `TEXT` | Strings. Used for names, UUIDs, JSON strings, dates. | `string` |
-| `REAL` | Floating point numbers. | `number` |
-| `BLOB` | Binary data. | `Buffer` / `Uint8Array` |
-| `NUMERIC` | Flexible number type. | `number` |
-
-### Field Options
-
-```javascript
-fields: {
-  // Primary Key (Auto Incrementing)
-  id: { type: "INTEGER", pk: true, autoIncrement: true },
-
-  // Required Field
-  username: { type: "TEXT", notNull: true },
-
-  // Default Value (SQL syntax)
-  role: { type: "TEXT", default: "'user'" },
-  created_at: { type: "TEXT", default: "CURRENT_TIMESTAMP" },
-  
-  // Boolean (Convention: 0 = false, 1 = true)
-  is_verified: { type: "INTEGER", default: 0 } 
-}
-```
+> **🛡️ Safety Note:** `initDB` checks your schema against the actual database. If you add new fields to your `schema.js`, `initDB` will automatically `ALTER TABLE` to add them. **It will NEVER delete columns or drop tables**, ensuring your data is safe.
 
 ---
 
 ## API Reference
 
-### `findMany({ where, select, orderBy, limit, offset })`
+### `createClient(schema)`
+
+Returns an object with:
+- `db`: The query builder interface (e.g., `db.users.findMany`).
+- `initDB({ verbose })`: Function to initialize/migrate the DB.
+- `dropDB({ verbose })`: Function to drop all tables (Destructive!).
+
+### `db.<table>.findMany({ where, select, orderBy, limit, offset })`
 
 Retrieve multiple records with powerful filtering.
 
@@ -187,7 +147,7 @@ const results = await db.users.findMany({
 - `endsWith`: Suffix match (`LIKE %val`).
 - `in`: Match any value in an array.
 
-### `findUnique({ where, select })`
+### `db.<table>.findUnique({ where, select })`
 
 Retrieve a single record. Best used with unique fields like IDs or emails.
 
@@ -198,7 +158,7 @@ const user = await db.users.findUnique({
 // Returns: { id: 1, name: "Alice", ... } or null
 ```
 
-### `findFirst({ where, select, orderBy })`
+### `db.<table>.findFirst({ where, select, orderBy })`
 
 Retrieve the first record matching the criteria.
 
@@ -210,7 +170,7 @@ const latestPost = await db.posts.findFirst({
 // Returns: { id: "post_123", title: "My First Post", ... } or null
 ```
 
-### `create({ data, select })`
+### `db.<table>.create({ data, select })`
 
 Insert a new record. Returns the created record (including auto-generated IDs).
 
@@ -224,7 +184,7 @@ const newUser = await db.users.create({
 // Returns: { id: 2, name: "Bob", email: "bob@example.com", ... }
 ```
 
-### `update({ where, data, select })`
+### `db.<table>.update({ where, data, select })`
 
 Update records matching the `where` clause.
 
@@ -239,7 +199,9 @@ const updated = await db.users.update({
 // Returns: { id: 1, name: "Robert", is_active: 1, ... } (Updated Record)
 ```
 
-### `delete({ where })`
+**Note on Primary Keys**: If your table has a `primaryKey` defined in the schema, `update` will attempt to fetch the updated record efficiently. If not (e.g., composite keys), it will try to find the first record matching your `where` clause.
+
+### `db.<table>.delete({ where })`
 
 Delete records.
 
@@ -250,7 +212,7 @@ await db.users.delete({
 // Returns: true
 ```
 
-### `count({ where })`
+### `db.<table>.count({ where })`
 
 Count records matching the criteria.
 
