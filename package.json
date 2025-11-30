@@ -1,0 +1,37 @@
+{
+  "name": "rqlink",
+  "version": "1.0.0",
+  "description": "A lightweight, intuitive, Prisma-style client for rqlite.",
+  "main": "rqlink.js",
+  "type": "module",
+  "files": [
+    "rqlink.js",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ManwilBahaa/rqlink.git"
+  },
+  "keywords": [
+    "rqlite",
+    "sqlite",
+    "database",
+    "client",
+    "prisma-style",
+    "prisma",
+    "orm",
+    "rqlite-connector",
+    "rqlite-client",
+    "distributed-database",
+    "sql",
+    "query-builder",
+    "node",
+    "bun"
+  ],
+  "author": "Manwil Bahaa Zaki <manwilbahaa@gmail.com> (https://linkedin.com/in/manwil)",
+  "license": "ISC",
+  "peerDependencies": {}
+}
