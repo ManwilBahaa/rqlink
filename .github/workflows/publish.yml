@@ -3,7 +3,7 @@ name: Publish to NPM
 on:
   push:
     branches:
-      -main
+      - main
 
 jobs:
   build:
@@ -18,7 +18,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           
       # Install Dependencies (if any)
-      - run: npm install
+      # - run: npm install
       
       # Run Tests (Optional but recommended)
       # - run: npm test
