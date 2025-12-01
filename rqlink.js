@@ -134,7 +134,13 @@ export async function executeSQL(port, sql, params = {}) {
 export async function querySQL(port, sql, params = {}) {
   if (CONFIG.verbose) console.log(`QUERY [${port}]:`, sql, params);
   // Use level=strong to ensure we read the latest writes (critical for read-after-write)
-  const res = await rqliteRequest(port, "/db/query?level=strong", [[sql, params]]);
+  let res;
+
+  if(sql.includes("PRAGMA")){
+    res = await rqliteRequest(port, "/db/query?level=strong", [[sql, params]]);
+  }else{
+    res = await rqliteRequest(port, "/db/query?level=none&freshness=1s&freshness_strict", [[sql, params]]);
+  }
 
   if (res.error) return res;
 
