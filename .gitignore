@@ -5,3 +5,4 @@ node_modules
 test_*.js
 schema.js
 index.js
+*.txt

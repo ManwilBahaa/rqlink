@@ -211,6 +211,29 @@ await db.posts.update({
 });
 ```
 
+#### Math Operations
+Perform complex mathematical updates using current values.
+
+```javascript
+await db.products.update({
+  where: { id: 1 },
+  data: {
+    // Simple math
+    score: { math: "score * 1.5" },
+
+    // Complex math with variables (safe parameter binding)
+    // Example: Update moving average
+    avg_review: {
+      math: "(avg_review * number_of_reviews + :new_rating) / (number_of_reviews + 1)",
+      args: { new_rating: 5 }
+    },
+    
+    // Combine with other updates
+    number_of_reviews: { increment: 1 }
+  }
+});
+```
+
 ### `db.batch.start()` - Batch Transactions
 
 Queue multiple operations and execute them in a single batch per port.

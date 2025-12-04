@@ -351,20 +351,45 @@ function buildModel(tableName, cfg) {
         if (!fields.includes(c)) throw new Error(`Unknown column "${c}"`);
       }
 
-      // Handle atomic increments and standard updates
+      // Handle atomic increments, math operations, and standard updates
       const setClauses = [];
       const params = { ...buildWhere(where, fields).params }; // Start with where params
 
       // We need to be careful not to collide with where params, so we prefix data params
       const dataParamPrefix = "data_";
+      let mathParamIdx = 0;
 
       for (const c of setCols) {
         const val = data[c];
-        if (val && typeof val === "object" && val.increment !== undefined) {
-          // Atomic increment: col = col + val
-          const paramName = `${dataParamPrefix}${c}`;
-          setClauses.push(`${c} = ${c} + :${paramName}`);
-          params[paramName] = val.increment;
+        if (val && typeof val === "object") {
+          if (val.increment !== undefined) {
+            // Atomic increment: col = col + val
+            const paramName = `${dataParamPrefix}${c}`;
+            setClauses.push(`${c} = ${c} + :${paramName}`);
+            params[paramName] = val.increment;
+          } else if (val.math !== undefined) {
+            // Math operation: col = expression
+            // User is responsible for ensuring the expression is valid SQL for the column
+            // We support parameter binding via val.args
+            let expression = val.math;
+
+            if (val.args) {
+              for (const [argKey, argVal] of Object.entries(val.args)) {
+                const paramName = `${dataParamPrefix}math_${c}_${argKey}_${mathParamIdx++}`;
+                // Replace :argKey with :paramName in the expression to ensure uniqueness
+                // We use a regex to replace only whole words matching :argKey
+                const regex = new RegExp(`:${argKey}\\b`, 'g');
+                expression = expression.replace(regex, `:${paramName}`);
+                params[paramName] = argVal;
+              }
+            }
+            setClauses.push(`${c} = ${expression}`);
+          } else {
+            // Fallback for object that isn't a special operator (shouldn't happen with current types but safe)
+            const paramName = `${dataParamPrefix}${c}`;
+            setClauses.push(`${c} = :${paramName}`);
+            params[paramName] = val;
+          }
         } else {
           // Standard set: col = val
           const paramName = `${dataParamPrefix}${c}`;
@@ -476,16 +501,34 @@ function createBatchBuilder(schemaDef) {
       update({ where, data }) {
         if (!where || !data) throw new Error("update requires where and data");
 
-        // Handle increments in batch too
+        // Handle increments and math in batch too
         const setClauses = [];
         const params = { ...buildWhere(where, fields, "w").params };
         const dataParamPrefix = "d_"; // distinct prefix
+        let mathParamIdx = 0;
 
         for (const [key, val] of Object.entries(data)) {
-          if (val && typeof val === "object" && val.increment !== undefined) {
-            const pName = `${dataParamPrefix}${key}`;
-            setClauses.push(`${key} = ${key} + :${pName}`);
-            params[pName] = val.increment;
+          if (val && typeof val === "object") {
+            if (val.increment !== undefined) {
+              const pName = `${dataParamPrefix}${key}`;
+              setClauses.push(`${key} = ${key} + :${pName}`);
+              params[pName] = val.increment;
+            } else if (val.math !== undefined) {
+              let expression = val.math;
+              if (val.args) {
+                for (const [argKey, argVal] of Object.entries(val.args)) {
+                  const paramName = `${dataParamPrefix}math_${key}_${argKey}_${mathParamIdx++}`;
+                  const regex = new RegExp(`:${argKey}\\b`, 'g');
+                  expression = expression.replace(regex, `:${paramName}`);
+                  params[paramName] = argVal;
+                }
+              }
+              setClauses.push(`${key} = ${expression}`);
+            } else {
+              const pName = `${dataParamPrefix}${key}`;
+              setClauses.push(`${key} = :${pName}`);
+              params[pName] = val;
+            }
           } else {
             const pName = `${dataParamPrefix}${key}`;
             setClauses.push(`${key} = :${pName}`);
