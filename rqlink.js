@@ -136,9 +136,9 @@ export async function querySQL(port, sql, params = {}) {
   // Use level=strong to ensure we read the latest writes (critical for read-after-write)
   let res;
 
-  if(sql.includes("PRAGMA")){
+  if (sql.includes("PRAGMA")) {
     res = await rqliteRequest(port, "/db/query?level=strong", [[sql, params]]);
-  }else{
+  } else {
     res = await rqliteRequest(port, "/db/query?level=none&freshness=1s&freshness_strict", [[sql, params]]);
   }
 
@@ -264,10 +264,6 @@ function buildModel(tableName, cfg) {
   const pk = cfg.primaryKey || Object.keys(cfg.fields).find(k => cfg.fields[k].pk) || null;
 
   return {
-    /**
-     * Creates a new record.
-     * Uses INSERT ... RETURNING * for efficiency.
-     */
     async create({ data, select }) {
       if (!data || typeof data !== "object") throw new Error("create requires data object");
       const cols = Object.keys(data);
@@ -305,10 +301,6 @@ function buildModel(tableName, cfg) {
 
       return data; // Fallback
     },
-
-    /**
-     * Finds multiple records matching criteria.
-     */
     async findMany({ where, select, orderBy, limit, offset } = {}) {
       const { clause, params } = buildWhere(where, fields);
       const sel = buildSelect(select, fields);
@@ -332,18 +324,10 @@ function buildModel(tableName, cfg) {
 
       return await querySQL(port, sql, params);
     },
-
-    /**
-     * Finds a single unique record.
-     */
     async findUnique({ where, select }) {
       const rows = await this.findMany({ where, select, limit: 1 });
       return rows[0] || null;
     },
-
-    /**
-     * Finds the first record matching criteria.
-     */
     async findFirst({ where, select, orderBy }) {
       const rows = await this.findMany({ where, select, orderBy, limit: 1 });
       return rows[0] || null;
@@ -367,11 +351,30 @@ function buildModel(tableName, cfg) {
         if (!fields.includes(c)) throw new Error(`Unknown column "${c}"`);
       }
 
-      const setClause = setCols.map(c => `${c} = :set_${c}`).join(", ");
-      const { clause: whereClause, params: whereParams } = buildWhere(where, fields);
+      // Handle atomic increments and standard updates
+      const setClauses = [];
+      const params = { ...buildWhere(where, fields).params }; // Start with where params
 
-      const params = { ...whereParams };
-      for (const c of setCols) params[`set_${c}`] = data[c];
+      // We need to be careful not to collide with where params, so we prefix data params
+      const dataParamPrefix = "data_";
+
+      for (const c of setCols) {
+        const val = data[c];
+        if (val && typeof val === "object" && val.increment !== undefined) {
+          // Atomic increment: col = col + val
+          const paramName = `${dataParamPrefix}${c}`;
+          setClauses.push(`${c} = ${c} + :${paramName}`);
+          params[paramName] = val.increment;
+        } else {
+          // Standard set: col = val
+          const paramName = `${dataParamPrefix}${c}`;
+          setClauses.push(`${c} = :${paramName}`);
+          params[paramName] = val;
+        }
+      }
+
+      const setClause = setClauses.join(", ");
+      const { clause: whereClause } = buildWhere(where, fields); // Re-build just for clause string
 
       // OPTIMIZATION: Use RETURNING * to fetch updated rows immediately
       const sql = `UPDATE ${tableName} SET ${setClause} WHERE ${whereClause} RETURNING *;`;
@@ -402,10 +405,6 @@ function buildModel(tableName, cfg) {
 
       return null; // No record updated
     },
-
-    /**
-     * Deletes records matching criteria.
-     */
     async delete({ where }) {
       if (!where || Object.keys(where).length === 0) throw new Error("delete requires where");
       const { clause, params } = buildWhere(where, fields);
@@ -413,10 +412,6 @@ function buildModel(tableName, cfg) {
       await executeSQL(port, sql, params);
       return true; // Prisma returns the deleted object, but that requires a SELECT before DELETE
     },
-
-    /**
-     * Counts records matching criteria.
-     */
     async count({ where } = {}) {
       const { clause, params } = buildWhere(where, fields);
       const sql = `SELECT COUNT(1) AS count FROM ${tableName} WHERE ${clause};`;
@@ -424,6 +419,96 @@ function buildModel(tableName, cfg) {
       return (rows[0] && rows[0].count) ? Number(rows[0].count) : 0;
     }
   };
+}
+
+// ---------------------- BATCH FACTORY ----------------------
+
+/**
+ * Creates a batch builder for queuing operations.
+ * @param {Object} schemaDef - The schema definition.
+ */
+function createBatchBuilder(schemaDef) {
+  const operations = []; // Array of { port, sql, params }
+
+  const builder = {
+    /**
+     * Executes the queued batch operations.
+     * Groups operations by port and sends them as transactions.
+     */
+    async execute() {
+      // Group by port
+      const opsByPort = {};
+      for (const op of operations) {
+        if (!opsByPort[op.port]) opsByPort[op.port] = [];
+        opsByPort[op.port].push([op.sql, op.params]);
+      }
+
+      const results = {};
+      for (const [port, ops] of Object.entries(opsByPort)) {
+        // Send transaction request
+        // rqlite transaction API expects array of strings or [sql, params] arrays
+        if (CONFIG.verbose) console.log(`BATCH EXEC [${port}]:`, ops.length, "operations");
+
+        const res = await rqliteRequest(port, "/db/execute?transaction", ops);
+        results[port] = res;
+      }
+      return results;
+    },
+
+    // Alias for start() if user calls db.batch.start() recursively (though not intended)
+    start() { return this; }
+  };
+
+  // Generate table interfaces for the batch builder
+  for (const [tableName, cfg] of Object.entries(schemaDef)) {
+    const port = cfg.port;
+    const fields = Object.keys(cfg.fields);
+
+    builder[tableName] = {
+      create({ data }) {
+        if (!data) throw new Error("create requires data");
+        const cols = Object.keys(data);
+        const placeholders = cols.map(c => `:${c}`);
+        const sql = `INSERT INTO ${tableName} (${cols.join(", ")}) VALUES (${placeholders.join(", ")});`;
+        operations.push({ port, sql, params: data });
+        return builder; // Chainable
+      },
+      update({ where, data }) {
+        if (!where || !data) throw new Error("update requires where and data");
+
+        // Handle increments in batch too
+        const setClauses = [];
+        const params = { ...buildWhere(where, fields, "w").params };
+        const dataParamPrefix = "d_"; // distinct prefix
+
+        for (const [key, val] of Object.entries(data)) {
+          if (val && typeof val === "object" && val.increment !== undefined) {
+            const pName = `${dataParamPrefix}${key}`;
+            setClauses.push(`${key} = ${key} + :${pName}`);
+            params[pName] = val.increment;
+          } else {
+            const pName = `${dataParamPrefix}${key}`;
+            setClauses.push(`${key} = :${pName}`);
+            params[pName] = val;
+          }
+        }
+
+        const { clause: whereClause } = buildWhere(where, fields, "w");
+        const sql = `UPDATE ${tableName} SET ${setClauses.join(", ")} WHERE ${whereClause};`;
+        operations.push({ port, sql, params });
+        return builder;
+      },
+      delete({ where }) {
+        if (!where) throw new Error("delete requires where");
+        const { clause, params } = buildWhere(where, fields);
+        const sql = `DELETE FROM ${tableName} WHERE ${clause};`;
+        operations.push({ port, sql, params });
+        return builder;
+      }
+    };
+  }
+
+  return builder;
 }
 
 // ---------------------- INIT & EXPORT ----------------------
@@ -535,6 +620,11 @@ export function createClient(schemaDef) {
   for (const t of Object.keys(schemaDef)) {
     dbInterface[t] = buildModel(t, schemaDef[t]);
   }
+
+  // Add batch interface
+  dbInterface.batch = {
+    start: () => createBatchBuilder(schemaDef)
+  };
 
   return {
     db: dbInterface,

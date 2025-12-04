@@ -1,6 +1,6 @@
 # Rqlink
 
-Rqlink is a lightweight, intuitive, **[Prisma](https://www.prisma.io/) like ORM style** client for [rqlite](https://github.com/rqlite/rqlite). It provides a type-safe(ish) JavaScript API to interact with your distributed SQLite database, handling connections, query building, and **safe schema migrations** automatically.
+Rqlink is a lightweight, intuitive **SQL builder**, **[Prisma](https://www.prisma.io/) like ORM style** client for [rqlite](https://github.com/rqlite/rqlite). It provides a type-safe(ish) JavaScript API to interact with your distributed SQLite database, handling connections, query building, and **safe schema migrations** automatically.
 
 ## Features
 
@@ -197,6 +197,35 @@ const updated = await db.users.update({
   }
 });
 // Returns: { id: 1, name: "Robert", is_active: 1, ... } (Updated Record)
+```
+
+#### Atomic Increments
+You can atomically increment numeric fields using the `{ increment: value }` syntax.
+
+```javascript
+await db.posts.update({
+  where: { id: 123 },
+  data: {
+    views: { increment: 1 } // Increment views by 1
+  }
+});
+```
+
+### `db.batch.start()` - Batch Transactions
+
+Queue multiple operations and execute them in a single batch per port.
+
+```javascript
+// Start a batch session
+const batch = db.batch.start();
+
+// Queue operations (chainable)
+batch.users.create({ data: { name: "Charlie" } });
+batch.users.update({ where: { name: "Bob" }, data: { age: { increment: 1 } } });
+
+// Execute all queued operations
+// Returns an object with results grouped by port: { "4001": [ ...results ] }
+const results = await batch.execute();
 ```
 
 **Note on Primary Keys**: If your table has a `primaryKey` defined in the schema, `update` will attempt to fetch the updated record efficiently. If not (e.g., composite keys), it will try to find the first record matching your `where` clause.
