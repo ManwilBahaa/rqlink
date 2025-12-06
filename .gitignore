@@ -4,5 +4,5 @@ node_modules
 *.log
 test_*.js
 schema.js
-index.js
+# index.js
 *.txt

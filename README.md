@@ -1,15 +1,27 @@
-# Rqlink
+<img src="Rqlink logo.png" alt="Rqlink Logo" width="200"/>
 
-Rqlink is a lightweight, intuitive **SQL builder**, **[Prisma](https://www.prisma.io/) like ORM style** client for [rqlite](https://github.com/rqlite/rqlite). It provides a type-safe(ish) JavaScript API to interact with your distributed SQLite database, handling connections, query building, and **safe schema migrations** automatically.
+  ### Lightweight, Prisma-style ORM for rqlite
+  
+  [![npm version](https://img.shields.io/npm/v/rqlink.svg?style=flat-square&color=brightgreen)](https://www.npmjs.com/package/rqlink)
+  [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg?style=flat-square)](https://www.npmjs.com/package/rqlink)
+  [![Officially Recommended](https://img.shields.io/badge/rqlite-officially%20recommended-blue.svg?style=flat-square)](https://github.com/rqlite/rqlite)
+  [![License: ISC](https://img.shields.io/badge/License-ISC-yellow.svg?style=flat-square)](https://opensource.org/licenses/ISC)
+  
+  ---
+  
+  **Rqlink** is a lightweight, intuitive **SQL builder** and **[Prisma](https://www.prisma.io/)-like ORM** client for [rqlite](https://github.com/rqlite/rqlite). It provides a type-safe JavaScript API to interact with your distributed SQLite database, handling connections, query building, and **safe schema migrations** automatically.
+  
 
-## Features
+---
 
-- 🚀 **Prisma-like API**: `findMany`, `findUnique`, `create`, `update`, `delete`.
-- 🛡️ **Safe Migrations**: `initDB()` automatically creates tables and adds missing columns without data loss.
-- 🔍 **Powerful Filtering**: Support for `gt`, `lt`, `contains`, `startsWith`, `in`, `OR`, `NOT`, and more.
-- ⚡ **Multi-Port Support**: Easily manage sharded databases across different rqlite ports.
-- 🔑 **Composite Keys**: Support for composite unique constraints (e.g., `(user_id, post_id)`).
-- 📦 **Zero Dependencies**: Built on native `fetch`.
+## ✨ Features
+
+- 🚀 **Prisma-like API**: `findMany`, `findUnique`, `create`, `update`, `delete`
+- 🛡️ **Safe Migrations**: `initDB()` automatically creates tables and adds missing columns without data loss
+- 🔍 **Powerful Filtering**: Support for `gt`, `lt`, `contains`, `startsWith`, `in`, `OR`, `NOT`, and more
+- ⚡ **Multi-Port Support**: Easily manage sharded databases across different rqlite ports
+- 🔑 **Composite Keys**: Support for composite unique constraints (e.g., `(user_id, post_id)`)
+- 📦 **Zero Dependencies**: Built on native `fetch` - no external dependencies!
 
 ---
 
