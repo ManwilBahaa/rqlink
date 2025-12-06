@@ -1,5 +1,7 @@
+</br>
+</br>
 
-<img src="Rqlink logo.png" alt="Rqlink Logo" width="200" style="margin-top: 500px;"/>
+<img src="Rqlink logo.png" alt="Rqlink Logo" width="200"/>
 
   ### Lightweight, Prisma-style ORM for rqlite
   
