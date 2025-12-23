@@ -1,6 +1,7 @@
+</br>
+</br>
 
-<img src="Rqlink logo.png" alt="Rqlink Logo" width="200" style="margin-top: 500px;"/>
-
+<img src="Rqlink logo.png" alt="Rqlink Logo" width="200"/>
   ### Lightweight, Prisma-style ORM for rqlite
   
   [![npm version](https://img.shields.io/npm/v/rqlink.svg?style=flat-square&color=brightgreen)](https://www.npmjs.com/package/rqlink)
@@ -45,9 +46,12 @@ Create a `schema.js` file to define your database structure.
 ```javascript
 // schema.js
 export const schema = {
-  // Standard Table with Primary Key
+  // Standard Table with Primary Key & Auth/Base Config
   users: {
     port: 4001, // rqlite port for this table
+    base: ["http://192.168.1.10", "http://192.168.1.11"], // Optional: List of base URLs for distributed setups
+    username: "admin", // Optional: Basic Auth Username
+    password: "secret_password", // Optional: Basic Auth Password
     primaryKey: "id", // Optional: Helps optimize updates
     fields: {
       id: { type: "INTEGER", pk: true, autoIncrement: true },
@@ -65,6 +69,9 @@ export const schema = {
   // Table with Composite Key (No single PK)
   likes: {
     port: 4001,
+    // You can override base/auth per table if needed
+    username: "readonly_user",
+    password: "readonly_password",
     fields: {
       user_id: { type: "INTEGER" },
       post_id: { type: "INTEGER" },

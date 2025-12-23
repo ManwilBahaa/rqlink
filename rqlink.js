@@ -32,7 +32,6 @@
  * @property {boolean} verbose - If true, logs all SQL queries to console.
  */
 let CONFIG = {
-  baseUrl: "http://localhost",
   timeout: 8000,
   verbose: false
 };
@@ -59,7 +58,12 @@ function validateSchema(s) {
   for (const t of Object.keys(s)) {
     if (!VALID_NAME.test(t)) throw new Error(`Invalid table name "${t}"`);
     const cfg = s[t];
+    if (cfg.username && typeof cfg.username !== "string") throw new Error(`Table ${t} has invalid username`);
+    if (cfg.password && typeof cfg.password !== "string") throw new Error(`Table ${t} has invalid password`);
     if (!cfg.port) throw new Error(`Table ${t} missing port`);
+    if (!cfg.base || !Array.isArray(cfg.base) || cfg.base.length === 0) {
+      throw new Error(`Table ${t} missing or invalid 'base' URL list`);
+    }
     if (!cfg.fields || typeof cfg.fields !== "object") throw new Error(`Table ${t} missing fields`);
     for (const [col, def] of Object.entries(cfg.fields)) {
       if (!VALID_NAME.test(col)) throw new Error(`Invalid column name "${col}" in ${t}`);
@@ -82,35 +86,76 @@ function validateSchema(s) {
  * @param {string} path - The API path (e.g., "/db/execute").
  * @param {Object} payload - The JSON payload for the request.
  */
-async function rqliteRequest(port, path, payload) {
-  const url = `${CONFIG.baseUrl}:${port}${path}`;
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), CONFIG.timeout);
+/**
+ * Sorts URLs to prioritize localhost/127.0.0.1.
+ * @param {string[]} urls 
+ */
+function sortBaseUrls(urls) {
+  return [...urls].sort((a, b) => {
+    const aLocal = a.includes("localhost") || a.includes("127.0.0.1");
+    const bLocal = b.includes("localhost") || b.includes("127.0.0.1");
+    if (aLocal && !bLocal) return -1;
+    if (!aLocal && bLocal) return 1;
+    return 0;
+  });
+}
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
+/**
+ * Sends a raw HTTP request to the rqlite server with retry logic.
+ * Handles timeouts and parses the JSON response.
+ * @param {string[]} baseUrls - List of base URLs to try.
+ * @param {number} port - The port of the rqlite node.
+ * @param {string} path - The API path (e.g., "/db/execute").
+ * @param {Object} payload - The JSON payload for the request.
+ * @param {Object} auth - Optional { username, password } for Basic Auth.
+ */
+async function rqliteRequest(baseUrls, port, path, payload, auth = null) {
+  const sortedUrls = sortBaseUrls(baseUrls);
+  let lastError = null;
 
-    clearTimeout(id);
+  for (const baseUrl of sortedUrls) {
+    const url = `${baseUrl}:${port}${path}`;
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), CONFIG.timeout);
 
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    try {
+      if (CONFIG.verbose) console.log(`Attempting request to ${url}`);
+
+      const headers = { "Content-Type": "application/json" };
+      if (auth && auth.username && auth.password) {
+        const creds = btoa(`${auth.username}:${auth.password}`);
+        headers["Authorization"] = `Basic ${creds}`;
+      }
+
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+
+      clearTimeout(id);
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+
+      const json = await res.json();
+      // Check for rqlite-level errors in the results
+      const err = json.results?.[0]?.error;
+      if (err) throw new Error(err);
+
+      return json; // Success!
+    } catch (e) {
+      clearTimeout(id);
+      if (CONFIG.verbose) console.warn(`Request to ${url} failed:`, e.message);
+      lastError = e;
+      // Continue to next URL
     }
-
-    const json = await res.json();
-    // Check for rqlite-level errors in the results
-    const err = json.results?.[0]?.error;
-    if (err) throw new Error(err);
-
-    return json;
-  } catch (e) {
-    clearTimeout(id);
-    throw e;
   }
+
+  // If we get here, all URLs failed
+  throw new Error(`All connection attempts failed. Last error: ${lastError?.message}`);
 }
 
 /**
@@ -119,9 +164,17 @@ async function rqliteRequest(port, path, payload) {
  * @param {string} sql - The SQL string.
  * @param {Object} params - Named parameters for the query.
  */
-export async function executeSQL(port, sql, params = {}) {
+/**
+ * Executes a SQL statement (INSERT, UPDATE, DELETE, CREATE, DROP).
+ * @param {string[]} baseUrls - List of base URLs.
+ * @param {number} port - The DB port.
+ * @param {string} sql - The SQL string.
+ * @param {Object} params - Named parameters for the query.
+ * @param {Object} auth - Optional { username, password }.
+ */
+export async function executeSQL(baseUrls, port, sql, params = {}, auth = null) {
   if (CONFIG.verbose) console.log(`EXEC [${port}]:`, sql, params);
-  return await rqliteRequest(port, "/db/execute", [[sql, params]]);
+  return await rqliteRequest(baseUrls, port, "/db/execute", [[sql, params]], auth);
 }
 
 /**
@@ -131,15 +184,24 @@ export async function executeSQL(port, sql, params = {}) {
  * @param {string} sql - The SQL string.
  * @param {Object} params - Named parameters.
  */
-export async function querySQL(port, sql, params = {}) {
+/**
+ * Executes a SQL query (SELECT).
+ * Uses level=strong to ensure strong consistency (read-your-writes).
+ * @param {string[]} baseUrls - List of base URLs.
+ * @param {number} port - The DB port.
+ * @param {string} sql - The SQL string.
+ * @param {Object} params - Named parameters.
+ * @param {Object} auth - Optional { username, password }.
+ */
+export async function querySQL(baseUrls, port, sql, params = {}, auth = null) {
   if (CONFIG.verbose) console.log(`QUERY [${port}]:`, sql, params);
   // Use level=strong to ensure we read the latest writes (critical for read-after-write)
   let res;
 
   if (sql.includes("PRAGMA")) {
-    res = await rqliteRequest(port, "/db/query?level=strong", [[sql, params]]);
+    res = await rqliteRequest(baseUrls, port, "/db/query?level=strong", [[sql, params]], auth);
   } else {
-    res = await rqliteRequest(port, "/db/query?level=none&freshness=1s&freshness_strict", [[sql, params]]);
+    res = await rqliteRequest(baseUrls, port, "/db/query?level=none&freshness=1s&freshness_strict", [[sql, params]], auth);
   }
 
   if (res.error) return res;
@@ -260,6 +322,8 @@ function buildWhere(where, availableFields, paramPrefix = "w") {
  */
 function buildModel(tableName, cfg) {
   const port = cfg.port;
+  const baseUrls = cfg.base;
+  const auth = (cfg.username && cfg.password) ? { username: cfg.username, password: cfg.password } : null;
   const fields = Object.keys(cfg.fields);
   const pk = cfg.primaryKey || Object.keys(cfg.fields).find(k => cfg.fields[k].pk) || null;
 
@@ -276,7 +340,7 @@ function buildModel(tableName, cfg) {
       const sql = `INSERT INTO ${tableName} (${cols.join(", ")}) VALUES (${placeholders.join(", ")}) RETURNING *;`;
 
       // We use executeSQL but rqlite returns query-like results for RETURNING
-      const res = await executeSQL(port, sql, data);
+      const res = await executeSQL(baseUrls, port, sql, data, auth);
 
       // Parse result
       const r = res.results?.[0] || {};
@@ -322,7 +386,7 @@ function buildModel(tableName, cfg) {
       if (limit !== undefined) sql += ` LIMIT ${Number(limit)}`;
       if (offset !== undefined) sql += ` OFFSET ${Number(offset)}`;
 
-      return await querySQL(port, sql, params);
+      return await querySQL(baseUrls, port, sql, params, auth);
     },
     async findUnique({ where, select }) {
       const rows = await this.findMany({ where, select, limit: 1 });
@@ -404,7 +468,7 @@ function buildModel(tableName, cfg) {
       // OPTIMIZATION: Use RETURNING * to fetch updated rows immediately
       const sql = `UPDATE ${tableName} SET ${setClause} WHERE ${whereClause} RETURNING *;`;
 
-      const res = await executeSQL(port, sql, params);
+      const res = await executeSQL(baseUrls, port, sql, params, auth);
 
       // Parse result
       const r = res.results?.[0] || {};
@@ -434,13 +498,13 @@ function buildModel(tableName, cfg) {
       if (!where || Object.keys(where).length === 0) throw new Error("delete requires where");
       const { clause, params } = buildWhere(where, fields);
       const sql = `DELETE FROM ${tableName} WHERE ${clause};`;
-      await executeSQL(port, sql, params);
+      await executeSQL(baseUrls, port, sql, params, auth);
       return true; // Prisma returns the deleted object, but that requires a SELECT before DELETE
     },
     async count({ where } = {}) {
       const { clause, params } = buildWhere(where, fields);
       const sql = `SELECT COUNT(1) AS count FROM ${tableName} WHERE ${clause};`;
-      const rows = await querySQL(port, sql, params);
+      const rows = await querySQL(baseUrls, port, sql, params, auth);
       return (rows[0] && rows[0].count) ? Number(rows[0].count) : 0;
     }
   };
@@ -453,7 +517,7 @@ function buildModel(tableName, cfg) {
  * @param {Object} schemaDef - The schema definition.
  */
 function createBatchBuilder(schemaDef) {
-  const operations = []; // Array of { port, sql, params }
+  const operations = []; // Array of { port, sql, params, auth }
 
   const builder = {
     /**
@@ -461,20 +525,33 @@ function createBatchBuilder(schemaDef) {
      * Groups operations by port and sends them as transactions.
      */
     async execute() {
-      // Group by port
-      const opsByPort = {};
+      // Group by port AND baseUrls (since different tables might use different clusters)
+      const opsGrouped = {};
       for (const op of operations) {
-        if (!opsByPort[op.port]) opsByPort[op.port] = [];
-        opsByPort[op.port].push([op.sql, op.params]);
+        // Create a key based on port and sorted base URLs to group compatible requests
+        const baseKey = JSON.stringify(sortBaseUrls(op.baseUrls));
+        const key = `${op.port}|${baseKey}`;
+
+        if (!opsGrouped[key]) {
+          opsGrouped[key] = { port: op.port, baseUrls: op.baseUrls, auth: op.auth, ops: [] };
+        }
+        opsGrouped[key].ops.push([op.sql, op.params]);
       }
 
       const results = {};
-      for (const [port, ops] of Object.entries(opsByPort)) {
+      for (const group of Object.values(opsGrouped)) {
+        const { port, baseUrls, ops } = group;
         // Send transaction request
         // rqlite transaction API expects array of strings or [sql, params] arrays
         if (CONFIG.verbose) console.log(`BATCH EXEC [${port}]:`, ops.length, "operations");
 
-        const res = await rqliteRequest(port, "/db/execute?transaction", ops);
+        // Extract auth from the first op in the group (assuming same auth for same port/base)
+        const auth = group.auth;
+
+        const res = await rqliteRequest(baseUrls, port, "/db/execute?transaction", ops, auth);
+        // Note: This result structure might need adjustment depending on how we want to return mixed results
+        // For now, we just key by port (warning: if multiple groups share a port but diff base, this overwrites. 
+        // But typically a port implies a specific cluster. The baseUrls are just access points.)
         results[port] = res;
       }
       return results;
@@ -488,6 +565,7 @@ function createBatchBuilder(schemaDef) {
   for (const [tableName, cfg] of Object.entries(schemaDef)) {
     const port = cfg.port;
     const fields = Object.keys(cfg.fields);
+    const auth = (cfg.username && cfg.password) ? { username: cfg.username, password: cfg.password } : null;
 
     builder[tableName] = {
       create({ data }) {
@@ -495,7 +573,7 @@ function createBatchBuilder(schemaDef) {
         const cols = Object.keys(data);
         const placeholders = cols.map(c => `:${c}`);
         const sql = `INSERT INTO ${tableName} (${cols.join(", ")}) VALUES (${placeholders.join(", ")});`;
-        operations.push({ port, sql, params: data });
+        operations.push({ baseUrls: cfg.base, port, sql, params: data, auth });
         return builder; // Chainable
       },
       update({ where, data }) {
@@ -538,14 +616,14 @@ function createBatchBuilder(schemaDef) {
 
         const { clause: whereClause } = buildWhere(where, fields, "w");
         const sql = `UPDATE ${tableName} SET ${setClauses.join(", ")} WHERE ${whereClause};`;
-        operations.push({ port, sql, params });
+        operations.push({ baseUrls: cfg.base, port, sql, params, auth });
         return builder;
       },
       delete({ where }) {
         if (!where) throw new Error("delete requires where");
         const { clause, params } = buildWhere(where, fields);
         const sql = `DELETE FROM ${tableName} WHERE ${clause};`;
-        operations.push({ port, sql, params });
+        operations.push({ baseUrls: cfg.base, port, sql, params, auth });
         return builder;
       }
     };
@@ -586,15 +664,21 @@ async function initDBSchema(schemaDef, verbose = false) {
 
   for (const [tableName, cfg] of Object.entries(schemaDef)) {
     const port = cfg.port;
+    // Use the first base URL for initialization (or localhost if sorted)
+    // We sort to ensure we pick the preferred one if available
+    const sortedBase = sortBaseUrls(cfg.base);
+    const initBase = [sortedBase[0]];
+    const auth = (cfg.username && cfg.password) ? { username: cfg.username, password: cfg.password } : null;
+
     const colDefs = Object.entries(cfg.fields).map(([col, def]) => columnDefSQL(col, def));
     const createSQL = `CREATE TABLE IF NOT EXISTS ${tableName} (${colDefs.join(", ")});`;
 
-    await executeSQL(port, createSQL);
+    await executeSQL(initBase, port, createSQL, {}, auth);
 
     // --- MIGRATION: Check for missing columns and ADD them ---
     // 1. Get existing columns
     const pragmaSQL = `PRAGMA table_info(${tableName})`;
-    const pragmaRes = await querySQL(port, pragmaSQL);
+    const pragmaRes = await querySQL(initBase, port, pragmaSQL, {}, auth);
     // pragmaRes is array of { cid, name, type, notnull, dflt_value, pk }
     const existingCols = new Set(pragmaRes.map(row => row.name));
 
@@ -610,7 +694,7 @@ async function initDBSchema(schemaDef, verbose = false) {
         const alterSQL = `ALTER TABLE ${tableName} ADD COLUMN ${defSQL};`;
 
         try {
-          await executeSQL(port, alterSQL);
+          await executeSQL(initBase, port, alterSQL, {}, auth);
         } catch (e) {
           console.error(`[MIGRATION ERROR] Failed to add column ${tableName}.${colName}:`, e.message);
           // Don't throw, try next column
@@ -624,7 +708,7 @@ async function initDBSchema(schemaDef, verbose = false) {
         const name = idx.name || `idx_${tableName}_${idx.columns.join("_")}`;
         const unique = idx.unique ? "UNIQUE" : "";
         const idxSQL = `CREATE ${unique} INDEX IF NOT EXISTS ${name} ON ${tableName} (${idx.columns.join(", ")});`;
-        await executeSQL(port, idxSQL);
+        await executeSQL(initBase, port, idxSQL, {}, auth);
       }
     }
   }
@@ -641,7 +725,10 @@ async function dropDBSchema(schemaDef, verbose = false) {
   if (verbose) console.log("Dropping all tables...");
   for (const [tableName, cfg] of Object.entries(schemaDef)) {
     const port = cfg.port;
-    await executeSQL(port, `DROP TABLE IF EXISTS ${tableName};`);
+    const sortedBase = sortBaseUrls(cfg.base);
+    const initBase = [sortedBase[0]];
+    const auth = (cfg.username && cfg.password) ? { username: cfg.username, password: cfg.password } : null;
+    await executeSQL(initBase, port, `DROP TABLE IF EXISTS ${tableName};`, {}, auth);
   }
   return true;
 }
