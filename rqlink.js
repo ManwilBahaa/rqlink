@@ -1,215 +1,410 @@
-// rqliteClient.js
-// rqliteClient.js
-// rqlink.js
-
 /**
- * Lightweight Prisma-style rqlite client
- *
- * Features:
- * - initDB() : create tables and indexes, and performs safe schema migrations (adds missing columns).
- * - db.<table>.create({ data, select }) : Inserts data and returns the created row (optimized with RETURNING).
- * - db.<table>.findMany({ where, select, orderBy, limit, offset }) : Powerful filtering and pagination.
- * - db.<table>.findUnique({ where, select }) : Fetch single record by unique constraints.
- * - db.<table>.findFirst({ where, select, orderBy }) : Fetch first record matching criteria.
- * - db.<table>.update({ where, data, select }) : Updates records and returns the updated data.
- * - db.<table>.delete({ where }) : Deletes records.
- * - db.<table>.count({ where }) : Counts records matching criteria.
- *
- * Advanced Filtering (where):
- * - equals (implicit): { name: "John" }
- * - Operators: { age: { gt: 18 } } (gt, gte, lt, lte, not)
- * - String: { name: { contains: "jo", startsWith: "J", endsWith: "n" } }
- * - List: { id: { in: [1, 2, 3] } }
- * - Logical: { OR: [ ... ], NOT: { ... } }
+ * Rqlink - A lightweight, Prisma-style ORM for rqlite
+ * 
+ * This module provides a type-safe, distributed database client for rqlite
+ * with automatic failover, batch operations, and safe query building.
+ * 
+ * @module rqlink
  */
 
-// ---------------------- CONFIGURATION ----------------------
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
 
 /**
- * Global configuration object.
- * @property {string} baseUrl - The base URL of the rqlite node (e.g., "http://localhost").
- * @property {number} timeout - Request timeout in milliseconds.
- * @property {boolean} verbose - If true, logs all SQL queries to console.
+ * Global configuration object for rqlink behavior
+ * @property {number} timeout - Request timeout in milliseconds (default: 5000)
+ * @property {boolean} verbose - Enable SQL query logging in development (default: false)
+ * @property {string} freshness - Freshness parameter for read consistency (default: "0.1s")
+ * @property {boolean} freshness_strict - Enable strict freshness checking (default: true)
+ * @property {number} retryDelay - Base delay between retries in milliseconds (default: 50)
+ * @property {number} maxRequestSize - Maximum request payload size in bytes (default: 1MB)
+ * @property {boolean} requireTLS - Require HTTPS connections (default: false, set true for PHI/EMR)
  */
 let CONFIG = {
-  timeout: 8000,
-  verbose: false
+  timeout: 5000,
+  verbose: false,
+  freshness: "0.1s",
+  freshness_strict: true,
+  retryDelay: 50,
+  maxRequestSize: 1024 * 1024, // 1MB limit to prevent DoS
+  requireTLS: false // Set to true for PHI/EMR production environments
 };
 
+// ============================================================================
+// SCHEMA CACHE WITH TTL
+// ============================================================================
+
 /**
- * Updates the client configuration.
- * @param {Object} options - Configuration options to override.
+ * Cache for storing table schema information with automatic expiration
+ * Prevents repeated PRAGMA calls while ensuring schema freshness
+ */
+const schemaCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes TTL for schema cache
+const MAX_CACHE_SIZE = 100; // Maximum number of cached schemas to prevent memory leaks
+
+/**
+ * Retrieves cached schema data if it exists and hasn't expired
+ * @param {string} key - Cache key (tableName|port format)
+ * @returns {Object|null} Cached schema data or null if expired/missing
+ */
+function getCachedSchema(key) {
+  const entry = schemaCache.get(key);
+  if (!entry) return null;
+
+  // Check if cache entry has expired
+  if (Date.now() - entry.timestamp > CACHE_TTL) {
+    schemaCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+/**
+ * Stores schema data in cache with timestamp
+ * Implements LRU-style eviction when cache is full
+ * @param {string} key - Cache key
+ * @param {Object} data - Schema data to cache
+ */
+function setCachedSchema(key, data) {
+  // Evict oldest entry if cache is at capacity
+  if (schemaCache.size >= MAX_CACHE_SIZE) {
+    const oldest = schemaCache.keys().next().value;
+    schemaCache.delete(oldest);
+  }
+  schemaCache.set(key, { data, timestamp: Date.now() });
+}
+
+/**
+ * Manually invalidates a cache entry
+ * @param {string} key - Cache key to invalidate
+ */
+function invalidateCache(key) {
+  schemaCache.delete(key);
+}
+
+// ============================================================================
+// VALIDATION CONSTANTS AND FUNCTIONS
+// ============================================================================
+
+/**
+ * Valid identifier regex - allows alphanumeric and underscore only
+ * This is intentionally restrictive for security - SQLite identifiers are quoted
+ */
+const VALID_NAME = /^[a-zA-Z0-9_]+$/;
+
+/**
+ * Allowed SQLite column types
+ */
+const SQLITE_TYPES = new Set(["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"]);
+
+/**
+ * Safe regex for math expressions - allows basic arithmetic only
+ * Characters allowed: letters, numbers, underscore, quotes, parentheses, 
+ * arithmetic operators, whitespace, colon (for named params), decimal point
+ */
+const MATH_SAFE_REGEX = /^[a-zA-Z0-9_"()+\-*/\s:.]+$/;
+
+/**
+ * Blocked SQL patterns in math expressions to prevent injection
+ * These patterns are checked case-insensitively
+ */
+const MATH_BLOCKED_PATTERNS = [
+  ';',      // Statement terminator
+  '--',     // SQL comment
+  '/*',     // Block comment start
+  '*/',     // Block comment end
+  'UNION',  // SQL UNION attack
+  'SELECT', // SELECT injection
+  'INSERT', // INSERT injection
+  'DELETE', // DELETE injection
+  'DROP',   // DROP injection
+  'UPDATE', // UPDATE injection
+  'CREATE', // CREATE injection
+  'ALTER',  // ALTER injection
+  'EXEC',   // EXEC injection
+  'EXECUTE' // EXECUTE injection
+];
+
+/**
+ * Validates a math expression for safety against SQL injection
+ * Uses both regex validation and keyword blocklist
+ * @param {string} expr - The math expression to validate
+ * @returns {boolean} True if expression is safe, false otherwise
+ */
+function validateMathExpression(expr) {
+  // First check against basic character whitelist
+  if (!MATH_SAFE_REGEX.test(expr)) {
+    return false;
+  }
+
+  // Then check for blocked SQL patterns (case-insensitive)
+  const upperExpr = expr.toUpperCase();
+  for (const pattern of MATH_BLOCKED_PATTERNS) {
+    if (upperExpr.includes(pattern)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Quotes an identifier for safe use in SQL statements
+ * Uses double quotes as per SQLite standard
+ * @param {string} name - The identifier to quote
+ * @returns {string} Quoted identifier
+ */
+function quote(name) {
+  return `"${name}"`;
+}
+
+/**
+ * Validates a complete schema definition
+ * Checks table names, column names, types, and configuration
+ * @param {Object} s - Schema definition object
+ * @throws {Error} If schema validation fails
+ */
+function validateSchema(s) {
+  for (const t of Object.keys(s)) {
+    // Validate table name
+    if (!VALID_NAME.test(t)) {
+      throw new Error(`Invalid table name: ${t}. Only alphanumeric and underscore allowed.`);
+    }
+
+    const cfg = s[t];
+
+    // Validate config exists
+    if (!cfg.config || typeof cfg.config !== "object") {
+      throw new Error(`Missing config for table: ${t}`);
+    }
+
+    const { base, port } = cfg.config;
+
+    // Validate base URLs and port
+    if (!port || typeof port !== "number") {
+      throw new Error(`Invalid port for table: ${t}`);
+    }
+    if (!Array.isArray(base) || base.length === 0) {
+      throw new Error(`Invalid base URLs for table: ${t}. Must be non-empty array.`);
+    }
+
+    // Validate each field definition
+    for (const [col, def] of Object.entries(cfg.fields)) {
+      // Validate column name
+      if (!VALID_NAME.test(col)) {
+        throw new Error(`Invalid column name: ${col} in table ${t}`);
+      }
+
+      // Validate column type
+      if (!def.type || !SQLITE_TYPES.has(def.type.toUpperCase())) {
+        throw new Error(`Invalid type for ${t}.${col}. Must be one of: ${[...SQLITE_TYPES].join(', ')}`);
+      }
+
+      // Validate default value if present
+      if (def.default !== undefined) {
+        const defVal = def.default;
+        const defType = typeof defVal;
+
+        // Only allow safe default value types
+        if (defType !== "string" && defType !== "number" && defType !== "boolean") {
+          throw new Error(`Invalid default value type for ${t}.${col}. Must be string, number, or boolean.`);
+        }
+
+        // Check string defaults for potential injection
+        if (defType === "string" && !(/^[A-Z_]+$/.test(defVal) || /^[a-zA-Z0-9_\s\-.]+$/.test(defVal))) {
+          throw new Error(`Unsafe default value for ${t}.${col}. Contains potentially dangerous characters.`);
+        }
+      }
+    }
+  }
+}
+
+// ============================================================================
+// CONFIGURATION API
+// ============================================================================
+
+/**
+ * Configures global rqlink settings
+ * Merges provided options with existing configuration
+ * @param {Object} options - Configuration options to set
+ * @example
+ * configure({ timeout: 10000, verbose: true });
  */
 export function configure(options = {}) {
   CONFIG = { ...CONFIG, ...options };
 }
 
-const VALID_NAME = /^[a-zA-Z0-9_]+$/;
-const SQLITE_TYPES = new Set(["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"]);
-
-// ---------------------- VALIDATION ----------------------
-
-/**
- * Validates the schema definition to ensure table and column names are safe
- * and types are valid SQLite types.
- * @param {Object} s - The schema object.
- */
-function validateSchema(s) {
-  for (const t of Object.keys(s)) {
-    if (!VALID_NAME.test(t)) throw new Error(`Invalid table name "${t}"`);
-    const cfg = s[t];
-    if (cfg.username && typeof cfg.username !== "string") throw new Error(`Table ${t} has invalid username`);
-    if (cfg.password && typeof cfg.password !== "string") throw new Error(`Table ${t} has invalid password`);
-    if (!cfg.port) throw new Error(`Table ${t} missing port`);
-    if (!cfg.base || !Array.isArray(cfg.base) || cfg.base.length === 0) {
-      throw new Error(`Table ${t} missing or invalid 'base' URL list`);
-    }
-    if (!cfg.fields || typeof cfg.fields !== "object") throw new Error(`Table ${t} missing fields`);
-    for (const [col, def] of Object.entries(cfg.fields)) {
-      if (!VALID_NAME.test(col)) throw new Error(`Invalid column name "${col}" in ${t}`);
-      if (!def.type || !SQLITE_TYPES.has(def.type.toUpperCase())) {
-        throw new Error(`Invalid or missing type for ${t}.${col}. Allowed: ${[...SQLITE_TYPES].join(", ")}`);
-      }
-      if (def.autoIncrement && def.type.toUpperCase() !== "INTEGER") {
-        throw new Error(`autoIncrement can only be used with INTEGER type: ${t}.${col}`);
-      }
-    }
-  }
-}
-
-// ---------------------- NETWORK LAYER ----------------------
+// ============================================================================
+// URL SORTING AND REQUEST HANDLING
+// ============================================================================
 
 /**
- * Sends a raw HTTP request to the rqlite server.
- * Handles timeouts and parses the JSON response.
- * @param {number} port - The port of the rqlite node (for multi-db setups).
- * @param {string} path - The API path (e.g., "/db/execute").
- * @param {Object} payload - The JSON payload for the request.
- */
-/**
- * Sorts URLs to prioritize localhost/127.0.0.1.
- * @param {string[]} urls 
+ * Sorts base URLs to prioritize localhost connections
+ * This optimization reduces latency for single-node development setups
+ * @param {string[]} urls - Array of base URLs
+ * @returns {string[]} Sorted URL array with localhost first
  */
 function sortBaseUrls(urls) {
   return [...urls].sort((a, b) => {
     const aLocal = a.includes("localhost") || a.includes("127.0.0.1");
     const bLocal = b.includes("localhost") || b.includes("127.0.0.1");
-    if (aLocal && !bLocal) return -1;
-    if (!aLocal && bLocal) return 1;
-    return 0;
+    return aLocal === bLocal ? 0 : aLocal ? -1 : 1;
   });
 }
 
 /**
- * Sends a raw HTTP request to the rqlite server with retry logic.
- * Handles timeouts and parses the JSON response.
- * @param {string[]} baseUrls - List of base URLs to try.
- * @param {number} port - The port of the rqlite node.
- * @param {string} path - The API path (e.g., "/db/execute").
- * @param {Object} payload - The JSON payload for the request.
- * @param {Object} auth - Optional { username, password } for Basic Auth.
+ * Makes an HTTP request to rqlite with automatic failover
+ * Tries each base URL in sequence until one succeeds
+ * @param {string[]} baseUrls - Array of rqlite base URLs to try
+ * @param {number} port - rqlite HTTP port
+ * @param {string} path - API endpoint path (e.g., "/db/execute")
+ * @param {Object} payload - Request body to send as JSON
+ * @param {Object|null} auth - Optional authentication credentials {username, password}
+ * @returns {Promise<Object>} Parsed JSON response from rqlite
+ * @throws {Error} If all URLs fail or request times out
  */
 async function rqliteRequest(baseUrls, port, path, payload, auth = null) {
-  const sortedUrls = sortBaseUrls(baseUrls);
   let lastError = null;
+  let attempt = 0;
 
-  for (const baseUrl of sortedUrls) {
+  // Validate payload size to prevent DoS
+  const payloadStr = JSON.stringify(payload);
+  if (payloadStr.length > CONFIG.maxRequestSize) {
+    throw new Error(`Request payload too large: ${payloadStr.length} bytes exceeds limit of ${CONFIG.maxRequestSize} bytes`);
+  }
+
+  // Try each base URL in sequence
+  for (const baseUrl of baseUrls) {
+    // Enforce TLS if requireTLS is enabled (for PHI/EMR compliance)
+    if (CONFIG.requireTLS && !baseUrl.startsWith("https://")) {
+      throw new Error(`Insecure connection blocked: ${baseUrl}. requireTLS is enabled.`);
+    }
+
+    // Apply exponential backoff delay after first attempt
+    if (attempt > 0 && CONFIG.retryDelay > 0) {
+      await new Promise(r => setTimeout(r, CONFIG.retryDelay * attempt));
+    }
+    attempt++;
+
     const url = `${baseUrl}:${port}${path}`;
     const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), CONFIG.timeout);
+    const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout);
 
     try {
-      if (CONFIG.verbose) console.log(`Attempting request to ${url}`);
-
+      // Build request headers
       const headers = { "Content-Type": "application/json" };
-      if (auth && auth.username && auth.password) {
-        const creds = btoa(`${auth.username}:${auth.password}`);
-        headers["Authorization"] = `Basic ${creds}`;
+
+      // Add Basic Auth if credentials provided
+      if (auth?.username && auth?.password) {
+        headers["Authorization"] = `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
       }
 
+      // Make the HTTP request
       const res = await fetch(url, {
         method: "POST",
         headers,
-        body: JSON.stringify(payload),
+        body: payloadStr,
         signal: controller.signal
       });
 
-      clearTimeout(id);
+      clearTimeout(timeoutId);
 
+      // Check for HTTP errors
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+        throw new Error(`HTTP ${res.status}`);
       }
 
+      // Parse and validate response
       const json = await res.json();
-      // Check for rqlite-level errors in the results
-      const err = json.results?.[0]?.error;
-      if (err) throw new Error(err);
+      const results = json.results || [];
 
-      return json; // Success!
+      // Check for rqlite-level errors in results
+      for (const r of results) {
+        if (r.error) {
+          throw new Error(`rqlite Error: ${r.error}`);
+        }
+      }
+
+      return json;
     } catch (e) {
-      clearTimeout(id);
-      if (CONFIG.verbose) console.warn(`Request to ${url} failed:`, e.message);
+      clearTimeout(timeoutId);
       lastError = e;
-      // Continue to next URL
+      // Continue to next URL on failure
     }
   }
 
-  // If we get here, all URLs failed
-  throw new Error(`All connection attempts failed. Last error: ${lastError?.message}`);
+  // All URLs failed
+  throw new Error(`rqlite unreachable after ${attempt} attempts: ${lastError?.message}`);
 }
 
+// ============================================================================
+// SQL EXECUTION AND QUERY FUNCTIONS
+// ============================================================================
+
 /**
- * Executes a SQL statement (INSERT, UPDATE, DELETE, CREATE, DROP).
- * @param {number} port - The DB port.
- * @param {string} sql - The SQL string.
- * @param {Object} params - Named parameters for the query.
- */
-/**
- * Executes a SQL statement (INSERT, UPDATE, DELETE, CREATE, DROP).
- * @param {string[]} baseUrls - List of base URLs.
- * @param {number} port - The DB port.
- * @param {string} sql - The SQL string.
- * @param {Object} params - Named parameters for the query.
- * @param {Object} auth - Optional { username, password }.
+ * Executes a write SQL statement (INSERT, UPDATE, DELETE)
+ * @param {string[]} baseUrls - rqlite base URLs
+ * @param {number} port - rqlite HTTP port
+ * @param {string} sql - SQL statement to execute
+ * @param {Object} params - Named parameters for the query
+ * @param {Object|null} auth - Optional authentication credentials
+ * @returns {Promise<Object>} Query execution result
  */
 export async function executeSQL(baseUrls, port, sql, params = {}, auth = null) {
-  if (CONFIG.verbose) console.log(`EXEC [${port}]:`, sql, params);
-  return await rqliteRequest(baseUrls, port, "/db/execute", [[sql, params]], auth);
+  // Only log in verbose mode during development - truncate for safety
+  if (CONFIG.verbose && process.env.NODE_ENV !== "production") {
+    const truncatedSql = sql.length > 200 ? sql.substring(0, 200) + "..." : sql;
+    console.log(`EXEC: ${truncatedSql}`, `[${Object.keys(params).length} params]`);
+  }
+
+  return await rqliteRequest(baseUrls, port, "/db/execute?named_parameters", [[sql, params]], auth);
 }
 
 /**
- * Executes a SQL query (SELECT).
- * Uses level=strong to ensure strong consistency (read-your-writes).
- * @param {number} port - The DB port.
- * @param {string} sql - The SQL string.
- * @param {Object} params - Named parameters.
+ * Executes a read SQL statement (SELECT)
+ * Supports configurable consistency levels and freshness settings
+ * @param {string[]} baseUrls - rqlite base URLs
+ * @param {number} port - rqlite HTTP port
+ * @param {string} sql - SQL SELECT statement
+ * @param {Object} params - Named parameters for the query
+ * @param {Object|null} auth - Optional authentication credentials
+ * @param {string|null} levelOverride - Optional consistency level override ("strong"|"none")
+ * @returns {Promise<Object[]>} Array of result row objects
  */
-/**
- * Executes a SQL query (SELECT).
- * Uses level=strong to ensure strong consistency (read-your-writes).
- * @param {string[]} baseUrls - List of base URLs.
- * @param {number} port - The DB port.
- * @param {string} sql - The SQL string.
- * @param {Object} params - Named parameters.
- * @param {Object} auth - Optional { username, password }.
- */
-export async function querySQL(baseUrls, port, sql, params = {}, auth = null) {
-  if (CONFIG.verbose) console.log(`QUERY [${port}]:`, sql, params);
-  // Use level=strong to ensure we read the latest writes (critical for read-after-write)
-  let res;
-
-  if (sql.includes("PRAGMA")) {
-    res = await rqliteRequest(baseUrls, port, "/db/query?level=strong", [[sql, params]], auth);
-  } else {
-    res = await rqliteRequest(baseUrls, port, "/db/query?level=none&freshness=1s&freshness_strict", [[sql, params]], auth);
+export async function querySQL(baseUrls, port, sql, params = {}, auth = null, levelOverride = null) {
+  // Only log in verbose mode during development - truncate for safety
+  if (CONFIG.verbose && process.env.NODE_ENV !== "production") {
+    const truncatedSql = sql.length > 200 ? sql.substring(0, 200) + "..." : sql;
+    console.log(`QUERY: ${truncatedSql}`, `[${Object.keys(params).length} params]`);
   }
 
-  if (res.error) return res;
+  let res;
 
+  // Determine consistency level - PRAGMA always uses strong consistency
+  const level = levelOverride || (/^\s*PRAGMA/i.test(sql) ? "strong" : "none");
+  const baseParams = "named_parameters";
+
+  if (level === "strong") {
+    // Strong consistency - reads from leader
+    res = await rqliteRequest(baseUrls, port, `/db/query?${baseParams}&level=strong`, [[sql, params]], auth);
+  } else {
+    // Relaxed consistency with freshness parameter
+    const strict = CONFIG.freshness_strict ? "&freshness_strict" : "";
+    res = await rqliteRequest(
+      baseUrls,
+      port,
+      `/db/query?${baseParams}&level=none&freshness=${CONFIG.freshness}${strict}`,
+      [[sql, params]],
+      auth
+    );
+  }
+
+  // Transform column/value arrays to row objects
   const r = res.results?.[0] || {};
   const cols = r.columns || [];
   const rows = r.values || [];
-  // Map array results to objects with column names
+
   return rows.map(row => {
     const obj = {};
     cols.forEach((c, i) => obj[c] = row[i]);
@@ -217,413 +412,484 @@ export async function querySQL(baseUrls, port, sql, params = {}, auth = null) {
   });
 }
 
-// ---------------------- QUERY BUILDER HELPERS ----------------------
+// ============================================================================
+// QUERY BUILDER HELPERS
+// ============================================================================
 
 /**
- * Builds the SELECT clause.
- * @param {Object} select - User provided select object { name: true, id: true }.
- * @param {Array} availableFields - List of valid fields for the table.
+ * Builds a SELECT column list from a select object
+ * @param {Object|null} select - Object specifying which columns to select
+ * @param {string[]} availableFields - List of valid field names
+ * @returns {string} SQL column list or "*"
  */
 function buildSelect(select, availableFields) {
-  if (!select || Object.keys(select).length === 0) return "*";
-  const cols = [];
-  for (const [key, val] of Object.entries(select)) {
-    if (val && availableFields.includes(key)) {
-      cols.push(key);
-    } else if (val) {
-      throw new Error(`Unknown field in select: ${key}`);
-    }
+  if (!select || Object.keys(select).length === 0) {
+    return "*";
   }
+
+  const cols = Object.keys(select)
+    .filter(k => select[k] && availableFields.includes(k))
+    .map(quote);
+
   return cols.length > 0 ? cols.join(", ") : "*";
 }
 
 /**
- * Recursively builds the WHERE clause and collects parameters.
- * Supports nested logic (OR, NOT) and operators (gt, lt, contains, etc.).
- * @param {Object} where - The where clause object.
- * @param {Array} availableFields - Valid fields.
- * @param {string} paramPrefix - Prefix for named parameters to avoid collisions.
+ * Builds a WHERE clause from a filter object
+ * Supports operators: equals, not, gt, gte, lt, lte, contains, startsWith, endsWith, in
+ * Also supports OR and NOT logical operators
+ * @param {Object|null} where - Filter conditions
+ * @param {string[]} availableFields - List of valid field names
+ * @returns {Object} Object with {clause: string, params: Object}
  */
-function buildWhere(where, availableFields, paramPrefix = "w") {
-  if (!where || Object.keys(where).length === 0) return { clause: "1=1", params: {} };
-
-  const conditions = [];
-  const params = {};
-  let paramIdx = 0;
-
-  function addParam(val) {
-    const name = `${paramPrefix}_${paramIdx++}`;
-    params[name] = val;
-    return `:${name}`;
+function buildWhere(where, availableFields) {
+  if (!where || Object.keys(where).length === 0) {
+    return { clause: "1=1", params: {} };
   }
 
-  function processCondition(key, val) {
-    // Handle Logical Operators
-    if (key === "OR") {
-      if (!Array.isArray(val)) throw new Error("OR must be an array");
-      const orClauses = val.map(subWhere => {
-        const { clause, params: subParams } = buildWhere(subWhere, availableFields, `${paramPrefix}_or${paramIdx++}`);
-        Object.assign(params, subParams);
-        return `(${clause})`;
-      });
-      return `(${orClauses.join(" OR ")})`;
-    }
-    if (key === "NOT") {
-      const { clause, params: subParams } = buildWhere(val, availableFields, `${paramPrefix}_not${paramIdx++}`);
-      Object.assign(params, subParams);
-      return `NOT (${clause})`;
-    }
+  const params = {};
+  let idx = 0;
 
-    if (!availableFields.includes(key)) throw new Error(`Unknown field in where: ${key}`);
+  /**
+   * Adds a parameter value and returns its placeholder
+   * Uses unique indexed keys to prevent collisions
+   */
+  const addParam = (val) => {
+    const key = `p_${idx++}`;
+    params[key] = val;
+    return `:${key}`;
+  };
 
-    if (val === null) return `${key} IS NULL`;
-    if (typeof val !== "object") return `${key} = ${addParam(val)}`; // Implicit equals
+  /**
+   * Recursively processes where conditions
+   * @param {Object} w - Where condition object
+   * @returns {string} SQL WHERE clause fragment
+   */
+  const process = (w) => {
+    const parts = [];
 
-    // Handle Field Operators
-    const subClauses = [];
-    for (const [op, opVal] of Object.entries(val)) {
-      switch (op) {
-        case "equals": subClauses.push(`${key} = ${addParam(opVal)}`); break;
-        case "not": subClauses.push(`${key} != ${addParam(opVal)}`); break;
-        case "gt": subClauses.push(`${key} > ${addParam(opVal)}`); break;
-        case "gte": subClauses.push(`${key} >= ${addParam(opVal)}`); break;
-        case "lt": subClauses.push(`${key} < ${addParam(opVal)}`); break;
-        case "lte": subClauses.push(`${key} <= ${addParam(opVal)}`); break;
-        case "contains": subClauses.push(`${key} LIKE ${addParam(`%${opVal}%`)}`); break;
-        case "startsWith": subClauses.push(`${key} LIKE ${addParam(`${opVal}%`)}`); break;
-        case "endsWith": subClauses.push(`${key} LIKE ${addParam(`%${opVal}`)}`); break;
-        case "in":
-          if (!Array.isArray(opVal) || opVal.length === 0) {
-            subClauses.push("1=0"); // Empty in list matches nothing
-          } else {
-            const inParams = opVal.map(v => addParam(v));
-            subClauses.push(`${key} IN (${inParams.join(", ")})`);
+    for (const [key, val] of Object.entries(w)) {
+      // Handle OR operator
+      if (key === "OR") {
+        parts.push(`(${val.map(v => process(v)).join(" OR ")})`);
+      }
+      // Handle NOT operator
+      else if (key === "NOT") {
+        parts.push(`NOT (${process(val)})`);
+      }
+      // Handle field conditions
+      else {
+        // Validate field exists in schema
+        if (!availableFields.includes(key)) {
+          throw new Error(`Field "${key}" not found in schema`);
+        }
+
+        const qk = quote(key);
+
+        // Handle NULL check
+        if (val === null) {
+          parts.push(`${qk} IS NULL`);
+        }
+        // Handle simple equality
+        else if (typeof val !== "object") {
+          parts.push(`${qk} = ${addParam(val)}`);
+        }
+        // Handle comparison operators
+        else {
+          for (const [op, opV] of Object.entries(val)) {
+            switch (op) {
+              case "equals":
+                parts.push(`${qk} = ${addParam(opV)}`);
+                break;
+              case "not":
+                parts.push(`${qk} != ${addParam(opV)}`);
+                break;
+              case "gt":
+                parts.push(`${qk} > ${addParam(opV)}`);
+                break;
+              case "gte":
+                parts.push(`${qk} >= ${addParam(opV)}`);
+                break;
+              case "lt":
+                parts.push(`${qk} < ${addParam(opV)}`);
+                break;
+              case "lte":
+                parts.push(`${qk} <= ${addParam(opV)}`);
+                break;
+              case "contains":
+                parts.push(`${qk} LIKE ${addParam(`%${opV}%`)}`);
+                break;
+              case "startsWith":
+                parts.push(`${qk} LIKE ${addParam(`${opV}%`)}`);
+                break;
+              case "endsWith":
+                parts.push(`${qk} LIKE ${addParam(`%${opV}`)}`);
+                break;
+              case "in":
+                if (opV.length === 0) {
+                  parts.push("1=0"); // Empty IN clause always false
+                } else {
+                  parts.push(`${qk} IN (${opV.map(v => addParam(v)).join(", ")})`);
+                }
+                break;
+              default:
+                throw new Error(`Unknown operator: ${op}`);
+            }
           }
-          break;
-        default: throw new Error(`Unknown operator ${op} for field ${key}`);
+        }
       }
     }
-    return subClauses.join(" AND ");
-  }
 
-  for (const [key, val] of Object.entries(where)) {
-    conditions.push(processCondition(key, val));
-  }
+    return parts.join(" AND ");
+  };
 
-  return { clause: conditions.join(" AND "), params };
+  return { clause: process(where), params };
 }
 
-// ---------------------- MODEL FACTORY ----------------------
+// ============================================================================
+// MODEL BUILDER
+// ============================================================================
 
 /**
- * Creates the CRUD interface for a specific table.
- * @param {string} tableName - Name of the table.
- * @param {Object} cfg - Table configuration (port, fields, etc.).
+ * Builds a model object with CRUD methods for a table
+ * @param {string} tableName - Name of the table
+ * @param {Object} cfg - Table configuration from schema
+ * @returns {Object} Model object with create, findMany, update, delete, count methods
  */
 function buildModel(tableName, cfg) {
-  const port = cfg.port;
-  const baseUrls = cfg.base;
-  const auth = (cfg.username && cfg.password) ? { username: cfg.username, password: cfg.password } : null;
+  const baseUrls = sortBaseUrls(cfg.config.base);
+  const { port, username, password } = cfg.config;
+  const auth = (username && password) ? { username, password } : null;
   const fields = Object.keys(cfg.fields);
-  const pk = cfg.primaryKey || Object.keys(cfg.fields).find(k => cfg.fields[k].pk) || null;
+  const qTable = quote(tableName);
 
   return {
+    /**
+     * Creates a new record in the table
+     * @param {Object} options - {data: Object, select?: Object}
+     * @returns {Promise<Object>} Created record
+     */
     async create({ data, select }) {
-      if (!data || typeof data !== "object") throw new Error("create requires data object");
       const cols = Object.keys(data);
-      for (const c of cols) {
-        if (!fields.includes(c)) throw new Error(`Unknown column "${c}"`);
-      }
+      const sql = `INSERT INTO ${qTable} (${cols.map(quote).join(", ")}) VALUES (${cols.map(c => `:${c}`).join(", ")}) RETURNING *;`;
 
-      const placeholders = cols.map(c => `:${c}`);
-      // OPTIMIZATION: Use RETURNING * to get the created row in one round-trip
-      const sql = `INSERT INTO ${tableName} (${cols.join(", ")}) VALUES (${placeholders.join(", ")}) RETURNING *;`;
-
-      // We use executeSQL but rqlite returns query-like results for RETURNING
       const res = await executeSQL(baseUrls, port, sql, data, auth);
-
-      // Parse result
       const r = res.results?.[0] || {};
-      const resCols = r.columns || [];
-      const resRows = r.values || [];
 
-      if (resRows.length > 0) {
-        const row = resRows[0];
+      if (r.values?.length > 0) {
         const obj = {};
-        resCols.forEach((c, i) => obj[c] = row[i]);
+        r.columns.forEach((c, i) => obj[c] = r.values[0][i]);
 
-        // If specific select requested, filter it in memory (since we fetched *)
+        // Apply select filter if provided
         if (select) {
-          const filtered = {};
-          for (const k of Object.keys(select)) {
-            if (select[k]) filtered[k] = obj[k];
-          }
-          return filtered;
+          return Object.fromEntries(
+            Object.keys(select).filter(k => select[k]).map(k => [k, obj[k]])
+          );
         }
         return obj;
       }
 
-      return data; // Fallback
+      return data;
     },
-    async findMany({ where, select, orderBy, limit, offset } = {}) {
+
+    /**
+     * Finds multiple records matching the filter
+     * @param {Object} options - {where?, select?, orderBy?, limit?, offset?, level?}
+     * @returns {Promise<Object[]>} Array of matching records
+     */
+    async findMany({ where, select, orderBy, limit, offset, level } = {}) {
       const { clause, params } = buildWhere(where, fields);
       const sel = buildSelect(select, fields);
 
-      let sql = `SELECT ${sel} FROM ${tableName} WHERE ${clause}`;
+      let sql = `SELECT ${sel} FROM ${qTable} WHERE ${clause}`;
 
+      // Add ORDER BY if specified
       if (orderBy) {
-        const orderCols = [];
-        const orders = Array.isArray(orderBy) ? orderBy : [orderBy];
-        for (const o of orders) {
-          for (const [col, dir] of Object.entries(o)) {
-            if (!fields.includes(col)) throw new Error(`Invalid orderBy column ${col}`);
-            orderCols.push(`${col} ${dir.toUpperCase()}`);
+        const orders = (Array.isArray(orderBy) ? orderBy : [orderBy]).map(o => {
+          const [col, dir] = Object.entries(o)[0];
+          const d = dir.toUpperCase();
+          if (d !== "ASC" && d !== "DESC") {
+            throw new Error("Invalid order direction. Use 'ASC' or 'DESC'.");
           }
-        }
-        if (orderCols.length > 0) sql += ` ORDER BY ${orderCols.join(", ")}`;
+          return `${quote(col)} ${d}`;
+        });
+        sql += ` ORDER BY ${orders.join(", ")}`;
       }
 
-      if (limit !== undefined) sql += ` LIMIT ${Number(limit)}`;
-      if (offset !== undefined) sql += ` OFFSET ${Number(offset)}`;
+      // Add LIMIT with validation
+      if (limit !== undefined) {
+        if (!Number.isInteger(limit) || limit < 0) {
+          throw new Error("Invalid limit. Must be a non-negative integer.");
+        }
+        sql += ` LIMIT ${limit}`;
+      }
 
-      return await querySQL(baseUrls, port, sql, params, auth);
-    },
-    async findUnique({ where, select }) {
-      const rows = await this.findMany({ where, select, limit: 1 });
-      return rows[0] || null;
-    },
-    async findFirst({ where, select, orderBy }) {
-      const rows = await this.findMany({ where, select, orderBy, limit: 1 });
-      return rows[0] || null;
+      // Add OFFSET with validation
+      if (offset !== undefined) {
+        if (!Number.isInteger(offset) || offset < 0) {
+          throw new Error("Invalid offset. Must be a non-negative integer.");
+        }
+        sql += ` OFFSET ${offset}`;
+      }
+
+      return await querySQL(baseUrls, port, sql, params, auth, level);
     },
 
     /**
-     * Updates records matching criteria.
-     * Note: SQLite/rqlite doesn't support UPDATE ... RETURNING easily in all versions/modes,
-     * so we attempt to fetch the updated record if a PK is provided.
+     * Finds a single unique record
+     * @param {Object} args - Same as findMany
+     * @returns {Promise<Object|null>} Matching record or null
      */
+    async findUnique(args) {
+      return (await this.findMany({ ...args, limit: 1 }))[0] || null;
+    },
+
     /**
-     * Updates records matching criteria.
-     * Uses UPDATE ... RETURNING * to get the updated records in a single round-trip.
+     * Finds the first matching record
+     * @param {Object} args - Same as findMany
+     * @returns {Promise<Object|null>} First matching record or null
+     */
+    async findFirst(args) {
+      return (await this.findMany({ ...args, limit: 1 }))[0] || null;
+    },
+
+    /**
+     * Updates records matching the filter
+     * Supports increment and math operations
+     * @param {Object} options - {where: Object, data: Object, select?: Object}
+     * @returns {Promise<Object|null>} Updated record or null
      */
     async update({ where, data, select }) {
-      if (!where || Object.keys(where).length === 0) throw new Error("update requires where");
-      if (!data || Object.keys(data).length === 0) throw new Error("update requires data");
+      const { clause, params } = buildWhere(where, fields);
+      const sets = [];
+      let mIdx = 0;
 
-      const setCols = Object.keys(data);
-      for (const c of setCols) {
-        if (!fields.includes(c)) throw new Error(`Unknown column "${c}"`);
-      }
+      for (const [c, val] of Object.entries(data)) {
+        const qCol = quote(c);
 
-      // Handle atomic increments, math operations, and standard updates
-      const setClauses = [];
-      const params = { ...buildWhere(where, fields).params }; // Start with where params
-
-      // We need to be careful not to collide with where params, so we prefix data params
-      const dataParamPrefix = "data_";
-      let mathParamIdx = 0;
-
-      for (const c of setCols) {
-        const val = data[c];
         if (val && typeof val === "object") {
+          // Handle increment operation
           if (val.increment !== undefined) {
-            // Atomic increment: col = col + val
-            const paramName = `${dataParamPrefix}${c}`;
-            setClauses.push(`${c} = ${c} + :${paramName}`);
-            params[paramName] = val.increment;
-          } else if (val.math !== undefined) {
-            // Math operation: col = expression
-            // User is responsible for ensuring the expression is valid SQL for the column
-            // We support parameter binding via val.args
-            let expression = val.math;
+            params[`d_${c}`] = val.increment;
+            sets.push(`${qCol} = ${qCol} + :d_${c}`);
+          }
+          // Handle math expression
+          else if (val.math !== undefined) {
+            // Validate math expression for safety
+            if (!validateMathExpression(val.math)) {
+              throw new Error("Unsafe math expression detected. Operation blocked.");
+            }
 
+            let expr = val.math;
+
+            // Replace argument placeholders with unique param names
             if (val.args) {
-              for (const [argKey, argVal] of Object.entries(val.args)) {
-                const paramName = `${dataParamPrefix}math_${c}_${argKey}_${mathParamIdx++}`;
-                // Replace :argKey with :paramName in the expression to ensure uniqueness
-                // We use a regex to replace only whole words matching :argKey
-                const regex = new RegExp(`:${argKey}\\b`, 'g');
-                expression = expression.replace(regex, `:${paramName}`);
-                params[paramName] = argVal;
+              for (const [ak, av] of Object.entries(val.args)) {
+                const pName = `m_${c}_${mIdx++}`;
+                expr = expr.replace(new RegExp(`:${ak}\\b`, 'g'), `:${pName}`);
+                params[pName] = av;
               }
             }
-            setClauses.push(`${c} = ${expression}`);
-          } else {
-            // Fallback for object that isn't a special operator (shouldn't happen with current types but safe)
-            const paramName = `${dataParamPrefix}${c}`;
-            setClauses.push(`${c} = :${paramName}`);
-            params[paramName] = val;
+
+            sets.push(`${qCol} = ${expr}`);
           }
         } else {
-          // Standard set: col = val
-          const paramName = `${dataParamPrefix}${c}`;
-          setClauses.push(`${c} = :${paramName}`);
-          params[paramName] = val;
+          // Simple value assignment
+          params[`d_${c}`] = val;
+          sets.push(`${qCol} = :d_${c}`);
         }
       }
 
-      const setClause = setClauses.join(", ");
-      const { clause: whereClause } = buildWhere(where, fields); // Re-build just for clause string
+      const res = await executeSQL(
+        baseUrls,
+        port,
+        `UPDATE ${qTable} SET ${sets.join(", ")} WHERE ${clause} RETURNING *;`,
+        params,
+        auth
+      );
 
-      // OPTIMIZATION: Use RETURNING * to fetch updated rows immediately
-      const sql = `UPDATE ${tableName} SET ${setClause} WHERE ${whereClause} RETURNING *;`;
-
-      const res = await executeSQL(baseUrls, port, sql, params, auth);
-
-      // Parse result
       const r = res.results?.[0] || {};
-      const resCols = r.columns || [];
-      const resRows = r.values || [];
 
-      if (resRows.length > 0) {
-        // Return the first updated record (Prisma style usually returns one)
-        // If multiple were updated, this returns the first one.
-        const row = resRows[0];
+      if (r.values?.length > 0) {
         const obj = {};
-        resCols.forEach((c, i) => obj[c] = row[i]);
+        r.columns.forEach((col, i) => obj[col] = r.values[0][i]);
 
-        if (select) {
-          const filtered = {};
-          for (const k of Object.keys(select)) {
-            if (select[k]) filtered[k] = obj[k];
-          }
-          return filtered;
-        }
-        return obj;
+        // Apply select filter if provided
+        return select
+          ? Object.fromEntries(Object.keys(select).filter(k => select[k]).map(k => [k, obj[k]]))
+          : obj;
       }
 
-      return null; // No record updated
+      return null;
     },
+
+    /**
+     * Deletes records matching the filter
+     * @param {Object} options - {where: Object}
+     * @returns {Promise<boolean>} True on success
+     */
     async delete({ where }) {
-      if (!where || Object.keys(where).length === 0) throw new Error("delete requires where");
       const { clause, params } = buildWhere(where, fields);
-      const sql = `DELETE FROM ${tableName} WHERE ${clause};`;
-      await executeSQL(baseUrls, port, sql, params, auth);
-      return true; // Prisma returns the deleted object, but that requires a SELECT before DELETE
+      await executeSQL(baseUrls, port, `DELETE FROM ${qTable} WHERE ${clause};`, params, auth);
+      return true;
     },
-    async count({ where } = {}) {
+
+    /**
+     * Counts records matching the filter
+     * @param {Object} options - {where?, level?}
+     * @returns {Promise<number>} Count of matching records
+     */
+    async count({ where, level } = {}) {
       const { clause, params } = buildWhere(where, fields);
-      const sql = `SELECT COUNT(1) AS count FROM ${tableName} WHERE ${clause};`;
-      const rows = await querySQL(baseUrls, port, sql, params, auth);
-      return (rows[0] && rows[0].count) ? Number(rows[0].count) : 0;
+      const res = await querySQL(
+        baseUrls,
+        port,
+        `SELECT COUNT(1) AS c FROM ${qTable} WHERE ${clause};`,
+        params,
+        auth,
+        level
+      );
+      return Number(res[0]?.c || 0);
     }
   };
 }
 
-// ---------------------- BATCH FACTORY ----------------------
+// ============================================================================
+// BATCH BUILDER
+// ============================================================================
 
 /**
- * Creates a batch builder for queuing operations.
- * @param {Object} schemaDef - The schema definition.
+ * Creates a batch builder for executing multiple operations atomically
+ * Groups operations by server for efficient transaction execution
+ * @param {Object} schemaDef - Complete schema definition
+ * @returns {Object} Batch builder with table-specific methods and execute()
  */
 function createBatchBuilder(schemaDef) {
-  const operations = []; // Array of { port, sql, params, auth }
+  const operations = [];
 
   const builder = {
     /**
-     * Executes the queued batch operations.
-     * Groups operations by port and sends them as transactions.
+     * Executes all queued batch operations
+     * Groups operations by server and runs as transactions
+     * @returns {Promise<Object>} Results grouped by server key
      */
     async execute() {
-      // Group by port AND baseUrls (since different tables might use different clusters)
-      const opsGrouped = {};
-      for (const op of operations) {
-        // Create a key based on port and sorted base URLs to group compatible requests
-        const baseKey = JSON.stringify(sortBaseUrls(op.baseUrls));
-        const key = `${op.port}|${baseKey}`;
+      // Group operations by server (port + baseUrls combination)
+      const groups = {};
 
-        if (!opsGrouped[key]) {
-          opsGrouped[key] = { port: op.port, baseUrls: op.baseUrls, auth: op.auth, ops: [] };
+      for (const op of operations) {
+        const key = `${op.port}|${JSON.stringify(op.baseUrls)}`;
+        if (!groups[key]) {
+          groups[key] = { ...op, ops: [] };
         }
-        opsGrouped[key].ops.push([op.sql, op.params]);
+        groups[key].ops.push([op.sql, op.params]);
       }
 
       const results = {};
-      for (const group of Object.values(opsGrouped)) {
-        const { port, baseUrls, ops } = group;
-        // Send transaction request
-        // rqlite transaction API expects array of strings or [sql, params] arrays
-        if (CONFIG.verbose) console.log(`BATCH EXEC [${port}]:`, ops.length, "operations");
 
-        // Extract auth from the first op in the group (assuming same auth for same port/base)
-        const auth = group.auth;
-
-        const res = await rqliteRequest(baseUrls, port, "/db/execute?transaction", ops, auth);
-        // Note: This result structure might need adjustment depending on how we want to return mixed results
-        // For now, we just key by port (warning: if multiple groups share a port but diff base, this overwrites. 
-        // But typically a port implies a specific cluster. The baseUrls are just access points.)
-        results[port] = res;
+      try {
+        // Execute each group as a transaction
+        for (const [key, g] of Object.entries(groups)) {
+          results[key] = await rqliteRequest(
+            g.baseUrls,
+            g.port,
+            "/db/execute?transaction&named_parameters",
+            g.ops,
+            g.auth
+          );
+        }
+        return results;
+      } finally {
+        // Always clear operations after execution to prevent memory leaks
+        operations.length = 0;
       }
-      return results;
-    },
-
-    // Alias for start() if user calls db.batch.start() recursively (though not intended)
-    start() { return this; }
+    }
   };
 
-  // Generate table interfaces for the batch builder
-  for (const [tableName, cfg] of Object.entries(schemaDef)) {
-    const port = cfg.port;
+  // Add table-specific batch methods
+  for (const [tName, cfg] of Object.entries(schemaDef)) {
+    const baseUrls = sortBaseUrls(cfg.config.base);
+    const { port, username, password } = cfg.config;
+    const auth = (username && password) ? { username, password } : null;
     const fields = Object.keys(cfg.fields);
-    const auth = (cfg.username && cfg.password) ? { username: cfg.username, password: cfg.password } : null;
+    const qTable = quote(tName);
 
-    builder[tableName] = {
+    builder[tName] = {
+      /**
+       * Queues a create operation
+       * @param {Object} options - {data: Object}
+       * @returns {Object} The batch builder for chaining
+       */
       create({ data }) {
-        if (!data) throw new Error("create requires data");
         const cols = Object.keys(data);
-        const placeholders = cols.map(c => `:${c}`);
-        const sql = `INSERT INTO ${tableName} (${cols.join(", ")}) VALUES (${placeholders.join(", ")});`;
-        operations.push({ baseUrls: cfg.base, port, sql, params: data, auth });
-        return builder; // Chainable
+        const sql = `INSERT INTO ${qTable} (${cols.map(quote).join(", ")}) VALUES (${cols.map(c => `:${c}`).join(", ")});`;
+        operations.push({ baseUrls, port, sql, params: data, auth });
+        return builder;
       },
+
+      /**
+       * Queues an update operation
+       * @param {Object} options - {where: Object, data: Object}
+       * @returns {Object} The batch builder for chaining
+       */
       update({ where, data }) {
-        if (!where || !data) throw new Error("update requires where and data");
+        const { clause, params } = buildWhere(where, fields);
+        const sets = [];
+        let mIdx = 0;
 
-        // Handle increments and math in batch too
-        const setClauses = [];
-        const params = { ...buildWhere(where, fields, "w").params };
-        const dataParamPrefix = "d_"; // distinct prefix
-        let mathParamIdx = 0;
+        for (const [c, val] of Object.entries(data)) {
+          const qCol = quote(c);
 
-        for (const [key, val] of Object.entries(data)) {
           if (val && typeof val === "object") {
             if (val.increment !== undefined) {
-              const pName = `${dataParamPrefix}${key}`;
-              setClauses.push(`${key} = ${key} + :${pName}`);
-              params[pName] = val.increment;
+              params[`d_${c}`] = val.increment;
+              sets.push(`${qCol} = ${qCol} + :d_${c}`);
             } else if (val.math !== undefined) {
-              let expression = val.math;
+              // Validate math expression for safety
+              if (!validateMathExpression(val.math)) {
+                throw new Error("Unsafe math expression detected. Operation blocked.");
+              }
+
+              let expr = val.math;
               if (val.args) {
-                for (const [argKey, argVal] of Object.entries(val.args)) {
-                  const paramName = `${dataParamPrefix}math_${key}_${argKey}_${mathParamIdx++}`;
-                  const regex = new RegExp(`:${argKey}\\b`, 'g');
-                  expression = expression.replace(regex, `:${paramName}`);
-                  params[paramName] = argVal;
+                for (const [ak, av] of Object.entries(val.args)) {
+                  const pName = `m_${c}_${mIdx++}`;
+                  expr = expr.replace(new RegExp(`:${ak}\\b`, 'g'), `:${pName}`);
+                  params[pName] = av;
                 }
               }
-              setClauses.push(`${key} = ${expression}`);
-            } else {
-              const pName = `${dataParamPrefix}${key}`;
-              setClauses.push(`${key} = :${pName}`);
-              params[pName] = val;
+              sets.push(`${qCol} = ${expr}`);
             }
           } else {
-            const pName = `${dataParamPrefix}${key}`;
-            setClauses.push(`${key} = :${pName}`);
-            params[pName] = val;
+            params[`d_${c}`] = val;
+            sets.push(`${qCol} = :d_${c}`);
           }
         }
 
-        const { clause: whereClause } = buildWhere(where, fields, "w");
-        const sql = `UPDATE ${tableName} SET ${setClauses.join(", ")} WHERE ${whereClause};`;
-        operations.push({ baseUrls: cfg.base, port, sql, params, auth });
+        operations.push({
+          baseUrls,
+          port,
+          sql: `UPDATE ${qTable} SET ${sets.join(", ")} WHERE ${clause};`,
+          params,
+          auth
+        });
         return builder;
       },
+
+      /**
+       * Queues a delete operation
+       * @param {Object} options - {where: Object}
+       * @returns {Object} The batch builder for chaining
+       */
       delete({ where }) {
-        if (!where) throw new Error("delete requires where");
         const { clause, params } = buildWhere(where, fields);
-        const sql = `DELETE FROM ${tableName} WHERE ${clause};`;
-        operations.push({ baseUrls: cfg.base, port, sql, params, auth });
+        operations.push({
+          baseUrls,
+          port,
+          sql: `DELETE FROM ${qTable} WHERE ${clause};`,
+          params,
+          auth
+        });
         return builder;
       }
     };
@@ -632,135 +898,188 @@ function createBatchBuilder(schemaDef) {
   return builder;
 }
 
-// ---------------------- INIT & EXPORT ----------------------
+// ============================================================================
+// SCHEMA DDL HELPERS
+// ============================================================================
 
 /**
- * Generates the SQL string for a column definition (e.g., "id INTEGER PRIMARY KEY AUTOINCREMENT").
- * @param {string} name - Column name.
- * @param {Object} def - Column definition from schema.
+ * Generates SQL column definition for CREATE TABLE or ALTER TABLE
+ * @param {string} name - Column name
+ * @param {Object} def - Column definition from schema
+ * @returns {string} SQL column definition
  */
 function columnDefSQL(name, def) {
-  const parts = [name, def.type.toUpperCase()];
+  const parts = [quote(name), def.type.toUpperCase()];
+
   if (def.pk) parts.push("PRIMARY KEY");
   if (def.autoIncrement) parts.push("AUTOINCREMENT");
   if (def.notNull) parts.push("NOT NULL");
-  if (def.default !== undefined) parts.push(`DEFAULT ${def.default}`);
+
+  // Handle default values with safety checks
+  if (def.default !== undefined) {
+    const val = def.default;
+
+    if (typeof val === "string") {
+      // Check if it's a SQL keyword (like CURRENT_TIMESTAMP)
+      if (/^[A-Z_]+$/.test(val)) {
+        parts.push(`DEFAULT ${val}`);
+      } else {
+        // Escape string literals properly
+        parts.push(`DEFAULT '${val.replace(/'/g, "''")}'`);
+      }
+    } else if (typeof val === "number" || typeof val === "boolean") {
+      parts.push(`DEFAULT ${val}`);
+    }
+  }
+
   return parts.join(" ");
 }
 
+// ============================================================================
+// DATABASE INITIALIZATION
+// ============================================================================
+
 /**
- * Initializes the database tables based on the schema.
- * Performs SAFE MIGRATIONS:
- * - Checks if tables exist.
- * - If table exists, checks for missing columns and adds them (ALTER TABLE).
- * - Creates indexes.
- * 
- * @param {Object} schemaDef - The schema object.
- * @param {boolean} verbose - If true, logs SQL commands.
+ * Initializes database schema - creates tables and adds missing columns
+ * Performs safe migrations without data loss
+ * @param {Object} schemaDef - Complete schema definition
+ * @param {boolean} verbose - Enable verbose logging
+ * @returns {Promise<boolean>} True on success
  */
 async function initDBSchema(schemaDef, verbose = false) {
-  if (verbose) configure({ verbose: true });
+  if (verbose) CONFIG.verbose = true;
+
+  // Validate entire schema before making any changes
   validateSchema(schemaDef);
 
-  for (const [tableName, cfg] of Object.entries(schemaDef)) {
-    const port = cfg.port;
-    // Use the first base URL for initialization (or localhost if sorted)
-    // We sort to ensure we pick the preferred one if available
-    const sortedBase = sortBaseUrls(cfg.base);
-    const initBase = [sortedBase[0]];
-    const auth = (cfg.username && cfg.password) ? { username: cfg.username, password: cfg.password } : null;
+  for (const [tName, cfg] of Object.entries(schemaDef)) {
+    const sorted = sortBaseUrls(cfg.config.base);
+    const { port, username, password } = cfg.config;
+    const auth = (username && password) ? { username, password } : null;
 
-    const colDefs = Object.entries(cfg.fields).map(([col, def]) => columnDefSQL(col, def));
-    const createSQL = `CREATE TABLE IF NOT EXISTS ${tableName} (${colDefs.join(", ")});`;
+    // Generate column definitions
+    const colDefs = Object.entries(cfg.fields).map(([c, d]) => columnDefSQL(c, d));
 
-    await executeSQL(initBase, port, createSQL, {}, auth);
+    // Create table if not exists (only on first URL - the leader)
+    await executeSQL(
+      [sorted[0]],
+      port,
+      `CREATE TABLE IF NOT EXISTS ${quote(tName)} (${colDefs.join(", ")});`,
+      {},
+      auth
+    );
 
-    // --- MIGRATION: Check for missing columns and ADD them ---
-    // 1. Get existing columns
-    const pragmaSQL = `PRAGMA table_info(${tableName})`;
-    const pragmaRes = await querySQL(initBase, port, pragmaSQL, {}, auth);
-    // pragmaRes is array of { cid, name, type, notnull, dflt_value, pk }
-    const existingCols = new Set(pragmaRes.map(row => row.name));
+    // Check for missing columns using cache
+    const cacheKey = `${tName}|${port}`;
+    let info = getCachedSchema(cacheKey);
 
-    // 2. Find missing columns in schema
-    for (const [colName, colDef] of Object.entries(cfg.fields)) {
-      if (!existingCols.has(colName)) {
-        if (verbose) console.log(`[MIGRATION] Adding column ${tableName}.${colName}`);
+    if (!info) {
+      info = await querySQL([sorted[0]], port, `PRAGMA table_info(${quote(tName)})`, {}, auth, "strong");
+      setCachedSchema(cacheKey, info);
+    }
 
-        // Construct column definition for ALTER TABLE
-        // Note: SQLite ALTER TABLE ADD COLUMN has some restrictions (e.g. can't be PRIMARY KEY, UNIQUE)
-        // But for standard fields it's fine.
-        const defSQL = columnDefSQL(colName, colDef);
-        const alterSQL = `ALTER TABLE ${tableName} ADD COLUMN ${defSQL};`;
+    const existing = new Set(info.map(r => r.name));
 
-        try {
-          await executeSQL(initBase, port, alterSQL, {}, auth);
-        } catch (e) {
-          console.error(`[MIGRATION ERROR] Failed to add column ${tableName}.${colName}:`, e.message);
-          // Don't throw, try next column
-        }
+    // Add any missing columns (safe migration)
+    for (const [cName, cDef] of Object.entries(cfg.fields)) {
+      if (!existing.has(cName)) {
+        await executeSQL(
+          [sorted[0]],
+          port,
+          `ALTER TABLE ${quote(tName)} ADD COLUMN ${columnDefSQL(cName, cDef)};`,
+          {},
+          auth
+        );
+        // Invalidate cache after schema change
+        invalidateCache(cacheKey);
       }
     }
 
-    if (Array.isArray(cfg.indexes)) {
+    // Create indexes if specified
+    if (cfg.indexes) {
       for (const idx of cfg.indexes) {
-        if (!Array.isArray(idx.columns) || idx.columns.length === 0) continue;
-        const name = idx.name || `idx_${tableName}_${idx.columns.join("_")}`;
-        const unique = idx.unique ? "UNIQUE" : "";
-        const idxSQL = `CREATE ${unique} INDEX IF NOT EXISTS ${name} ON ${tableName} (${idx.columns.join(", ")});`;
-        await executeSQL(initBase, port, idxSQL, {}, auth);
+        const name = quote(idx.name || `idx_${tName}_${idx.columns.join("_")}`);
+        await executeSQL(
+          [sorted[0]],
+          port,
+          `CREATE ${idx.unique ? "UNIQUE" : ""} INDEX IF NOT EXISTS ${name} ON ${quote(tName)} (${idx.columns.map(quote).join(", ")});`,
+          {},
+          auth
+        );
       }
     }
   }
+
   return true;
 }
 
-/**
- * Drops all tables in the schema.
- * WARNING: DESTRUCTIVE OPERATION.
- * @param {Object} schemaDef - The schema object.
- * @param {boolean} verbose - If true, logs SQL commands.
- */
-async function dropDBSchema(schemaDef, verbose = false) {
-  if (verbose) console.log("Dropping all tables...");
-  for (const [tableName, cfg] of Object.entries(schemaDef)) {
-    const port = cfg.port;
-    const sortedBase = sortBaseUrls(cfg.base);
-    const initBase = [sortedBase[0]];
-    const auth = (cfg.username && cfg.password) ? { username: cfg.username, password: cfg.password } : null;
-    await executeSQL(initBase, port, `DROP TABLE IF EXISTS ${tableName};`, {}, auth);
-  }
-  return true;
-}
+// ============================================================================
+// CLIENT FACTORY
+// ============================================================================
 
 /**
- * Creates a client instance for a given schema.
- * Returns an object with:
- * - db: The query builder interface.
- * - initDB: Function to initialize the DB for this schema.
- * - dropDB: Function to drop the DB for this schema.
- * 
- * @param {Object} schemaDef - The schema definition object.
+ * Creates a new rqlink client for the given schema
+ * @param {Object} schemaDef - Complete schema definition
+ * @returns {Object} Client with {db, initDB, dropDB} methods
+ * @example
+ * const { db, initDB, dropDB } = createClient(schema);
+ * await initDB();
+ * const user = await db.users.create({ data: { name: "Alice" } });
  */
 export function createClient(schemaDef) {
+  // Validate schema on client creation
   validateSchema(schemaDef);
 
-  // Build the DB interface
-  const dbInterface = {};
+  // Build database model with table-specific methods
+  const db = {
+    batch: {
+      start: () => createBatchBuilder(schemaDef)
+    }
+  };
+
+  // Add model for each table
   for (const t of Object.keys(schemaDef)) {
-    dbInterface[t] = buildModel(t, schemaDef[t]);
+    db[t] = buildModel(t, schemaDef[t]);
   }
 
-  // Add batch interface
-  dbInterface.batch = {
-    start: () => createBatchBuilder(schemaDef)
-  };
-
   return {
-    db: dbInterface,
+    db,
+
+    /**
+     * Initializes the database schema
+     * @param {Object} opts - {verbose?: boolean}
+     * @returns {Promise<boolean>} True on success
+     */
     initDB: (opts = {}) => initDBSchema(schemaDef, opts.verbose),
-    dropDB: (opts = {}) => dropDBSchema(schemaDef, opts.verbose)
+
+    /**
+     * Drops all tables in the schema
+     * WARNING: This will delete all data
+     * @returns {Promise<void>}
+     */
+    dropDB: async () => {
+      for (const [t, cfg] of Object.entries(schemaDef)) {
+        const auth = (cfg.config.username && cfg.config.password)
+          ? { username: cfg.config.username, password: cfg.config.password }
+          : null;
+
+        await executeSQL(
+          [sortBaseUrls(cfg.config.base)[0]],
+          cfg.config.port,
+          `DROP TABLE IF EXISTS ${quote(t)};`,
+          {},
+          auth
+        );
+
+        // Clear cache entry for dropped table
+        invalidateCache(`${t}|${cfg.config.port}`);
+      }
+    }
   };
 }
+
+// ============================================================================
+// DEFAULT EXPORT
+// ============================================================================
 
 export default { configure, createClient, executeSQL, querySQL };

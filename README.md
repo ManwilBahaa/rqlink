@@ -1,324 +1,203 @@
-</br>
-</br>
+# Rqlink
 
-<img src="Rqlink logo.png" alt="Rqlink Logo" width="200"/>
-  ### Lightweight, Prisma-style ORM for rqlite
-  
-  [![npm version](https://img.shields.io/npm/v/rqlink.svg?style=flat-square&color=brightgreen)](https://www.npmjs.com/package/rqlink)
-  [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg?style=flat-square)](https://www.npmjs.com/package/rqlink)
-  [![Officially Recommended](https://img.shields.io/badge/rqlite-officially%20recommended-blue.svg?style=flat-square)](https://github.com/rqlite/rqlite)
-  [![License: ISC](https://img.shields.io/badge/License-ISC-yellow.svg?style=flat-square)](https://opensource.org/licenses/ISC)
-  
-  ---
-  
-  **Rqlink** is a lightweight, intuitive **SQL builder** and **[Prisma](https://www.prisma.io/)-like ORM** client for [rqlite](https://github.com/rqlite/rqlite). It provides a type-safe JavaScript API to interact with your distributed SQLite database, handling connections, query building, and **safe schema migrations** automatically.
-  
+A lightweight, Prisma-style ORM for [rqlite](https://github.com/rqlite/rqlite), designed for distributed Node.js applications.
 
----
+![Rqlink Logo](./Rqlink%20logo.png)
 
-## ✨ Features
+## Features
 
-- 🚀 **Prisma-like API**: `findMany`, `findUnique`, `create`, `update`, `delete`
-- 🛡️ **Safe Migrations**: `initDB()` automatically creates tables and adds missing columns without data loss
-- 🔍 **Powerful Filtering**: Support for `gt`, `lt`, `contains`, `startsWith`, `in`, `OR`, `NOT`, and more
-- ⚡ **Multi-Port Support**: Easily manage sharded databases across different rqlite ports
-- 🔑 **Composite Keys**: Support for composite unique constraints (e.g., `(user_id, post_id)`)
-- 📦 **Zero Dependencies**: Built on native `fetch` - no external dependencies!
-
----
+- **Prisma-like API**: Familiar `create`, `findMany`, `findUnique`, `update`, `delete` syntax
+- **Safe Migrations**: `initDB()` automatically creates tables and adds missing columns without data loss
+- **Distributed & Resilient**: Supports multiple rqlite nodes with automatic failover and load balancing
+- **Multi-Database Support**: Manage tables across different rqlite clusters (ports) in a single schema
+- **Type Safety**: Validates schema definitions and ensures correct data types
+- **Batch Operations**: Support for atomic batch inserts/updates
+- **SQL Injection Protection**: Parameterized queries and strict math expression validation
+- **Schema Cache**: TTL-based caching for improved performance
 
 ## Installation
 
 ```bash
 npm install rqlink
-# or
-bun add rqlink
 ```
-
----
 
 ## Quick Start
 
 ### 1. Define your Schema
 
-Create a `schema.js` file to define your database structure.
-
 ```javascript
 // schema.js
 export const schema = {
-  // Standard Table with Primary Key & Auth/Base Config
   users: {
-    port: 4001, // rqlite port for this table
-    base: ["http://192.168.1.10", "http://192.168.1.11"], // Optional: List of base URLs for distributed setups
-    username: "admin", // Optional: Basic Auth Username
-    password: "secret_password", // Optional: Basic Auth Password
-    primaryKey: "id", // Optional: Helps optimize updates
+    config: {
+      port: 4001,
+      base: ["http://localhost", "http://192.168.1.5"], // List of rqlite nodes
+      username: "admin", // Optional Basic Auth
+      password: "secret_password"
+    },
     fields: {
       id: { type: "INTEGER", pk: true, autoIncrement: true },
-      email: { type: "TEXT", notNull: true },
+      email: { type: "TEXT" },
       name: { type: "TEXT" },
-      age: { type: "INTEGER" },
-      is_active: { type: "INTEGER", default: 1 },
       created_at: { type: "TEXT", default: "CURRENT_TIMESTAMP" }
     },
     indexes: [
-      { name: "uq_users_email", columns: ["email"], unique: true }
-    ]
-  },
-  
-  // Table with Composite Key (No single PK)
-  likes: {
-    port: 4001,
-    // You can override base/auth per table if needed
-    username: "readonly_user",
-    password: "readonly_password",
-    fields: {
-      user_id: { type: "INTEGER" },
-      post_id: { type: "INTEGER" },
-      created_at: { type: "TEXT", default: "CURRENT_TIMESTAMP" }
-    },
-    indexes: [
-      // Composite Unique Constraint acts as the "Key"
-      { name: "uq_likes", columns: ["user_id", "post_id"], unique: true }
+      { columns: ["email"], unique: true }
     ]
   }
 };
 ```
 
-### 2. Initialize the Client & Database
-
-Import `createClient` and your schema to start.
+### 2. Initialize Client
 
 ```javascript
-import { createClient } from "rqlink";
-import { schema } from "./schema.js";
+import { createClient } from 'rqlink';
+import { schema } from './schema.js';
 
-// Create the client instance
-const { db, initDB } = createClient(schema);
+const { db, initDB, dropDB } = createClient(schema);
 
-async function main() {
-  // Initialize tables (Safe Migration)
-  await initDB({ verbose: true });
-  console.log("Database initialized!");
-
-  // Use the client
-  const user = await db.users.create({
-    data: {
-      name: "Alice",
-      email: "alice@example.com",
-      age: 25
-    }
-  });
-  console.log("Created:", user);
-}
-
-main();
+// Initialize tables (create/migrate)
+await initDB({ verbose: true });
 ```
 
-> **🛡️ Safety Note:** `initDB` checks your schema against the actual database. If you add new fields to your `schema.js`, `initDB` will automatically `ALTER TABLE` to add them. **It will NEVER delete columns or drop tables**, ensuring your data is safe.
-
----
-
-## API Reference
-
-### `createClient(schema)`
-
-Returns an object with:
-- `db`: The query builder interface (e.g., `db.users.findMany`).
-- `initDB({ verbose })`: Function to initialize/migrate the DB.
-- `dropDB({ verbose })`: Function to drop all tables (Destructive!).
-
-### `db.<table>.findMany({ where, select, orderBy, limit, offset })`
-
-Retrieve multiple records with powerful filtering.
+### 3. CRUD Operations
 
 ```javascript
-const results = await db.users.findMany({
-  where: {
-    // Exact match
-    role: "admin",
-    
-    // Logical Operators
-    OR: [
-      { age: { gt: 30 } },
-      { age: { lt: 20 } }
-    ],
-    
-    // Field Operators
-    name: { contains: "John" }, // LIKE %John%
-    status: { in: ["active", "pending"] },
-    score: { gte: 50, lte: 100 }
-  },
-  select: { id: true, name: true }, // Only fetch these columns
-  orderBy: { created_at: "desc" },
-  limit: 10,
-  offset: 0
+// Create
+const user = await db.users.create({
+  data: { email: "alice@example.com", name: "Alice" }
 });
-// Returns: [ { id: 5, name: "John Doe" }, { id: 8, name: "Johnny" } ]
-```
 
-#### Supported Filters
-- `equals`: Exact match (implicit if value is not an object).
-- `not`: Not equal.
-- `gt`, `gte`: Greater than (or equal).
-- `lt`, `lte`: Less than (or equal).
-- `contains`: Substring match (`LIKE %val%`).
-- `startsWith`: Prefix match (`LIKE val%`).
-- `endsWith`: Suffix match (`LIKE %val`).
-- `in`: Match any value in an array.
-
-### `db.<table>.findUnique({ where, select })`
-
-Retrieve a single record. Best used with unique fields like IDs or emails.
-
-```javascript
-const user = await db.users.findUnique({
-  where: { email: "alice@example.com" }
+// Find Many
+const users = await db.users.findMany({
+  where: { name: { contains: "Ali" } },
+  orderBy: { id: "desc" },
+  limit: 10
 });
-// Returns: { id: 1, name: "Alice", ... } or null
-```
 
-### `db.<table>.findFirst({ where, select, orderBy })`
-
-Retrieve the first record matching the criteria.
-
-```javascript
-const latestPost = await db.posts.findFirst({
-  where: { user_id: 1 },
-  orderBy: { created_at: "desc" }
-});
-// Returns: { id: "post_123", title: "My First Post", ... } or null
-```
-
-### `db.<table>.create({ data, select })`
-
-Insert a new record. Returns the created record (including auto-generated IDs).
-
-```javascript
-const newUser = await db.users.create({
-  data: {
-    name: "Bob",
-    email: "bob@example.com"
-  }
-});
-// Returns: { id: 2, name: "Bob", email: "bob@example.com", ... }
-```
-
-### `db.<table>.update({ where, data, select })`
-
-Update records matching the `where` clause.
-
-```javascript
+// Update with math expression
 const updated = await db.users.update({
-  where: { id: 1 },
-  data: {
-    name: "Robert",
-    is_active: 1
+  where: { id: user.id },
+  data: { 
+    balance: { math: '"balance" * 2 + :bonus', args: { bonus: 50 } }
   }
 });
-// Returns: { id: 1, name: "Robert", is_active: 1, ... } (Updated Record)
+
+// Delete
+await db.users.delete({ where: { id: user.id } });
 ```
 
-#### Atomic Increments
-You can atomically increment numeric fields using the `{ increment: value }` syntax.
+### 4. Batch Operations
 
 ```javascript
-await db.posts.update({
-  where: { id: 123 },
-  data: {
-    views: { increment: 1 } // Increment views by 1
-  }
-});
-```
-
-#### Math Operations
-Perform complex mathematical updates using current values.
-
-```javascript
-await db.products.update({
-  where: { id: 1 },
-  data: {
-    // Simple math
-    score: { math: "score * 1.5" },
-
-    // Complex math with variables (safe parameter binding)
-    // Example: Update moving average
-    avg_review: {
-      math: "(avg_review * number_of_reviews + :new_rating) / (number_of_reviews + 1)",
-      args: { new_rating: 5 }
-    },
-    
-    // Combine with other updates
-    number_of_reviews: { increment: 1 }
-  }
-});
-```
-
-### `db.batch.start()` - Batch Transactions
-
-Queue multiple operations and execute them in a single batch per port.
-
-```javascript
-// Start a batch session
 const batch = db.batch.start();
 
-// Queue operations (chainable)
-batch.users.create({ data: { name: "Charlie" } });
-batch.users.update({ where: { name: "Bob" }, data: { age: { increment: 1 } } });
+batch.users.create({ data: { name: "Bob", email: "bob@test.com" } });
+batch.users.update({ 
+  where: { name: "Alice" }, 
+  data: { balance: { increment: 100 } } 
+});
 
-// Execute all queued operations
-// Returns an object with results grouped by port: { "4001": [ ...results ] }
 const results = await batch.execute();
 ```
 
-**Note on Primary Keys**: If your table has a `primaryKey` defined in the schema, `update` will attempt to fetch the updated record efficiently. If not (e.g., composite keys), it will try to find the first record matching your `where` clause.
-
-### `db.<table>.delete({ where })`
-
-Delete records.
-
-```javascript
-await db.users.delete({
-  where: { id: 1 }
-});
-// Returns: true
-```
-
-### `db.<table>.count({ where })`
-
-Count records matching the criteria.
-
-```javascript
-const count = await db.users.count({
-  where: { is_active: 1 }
-});
-// Returns: 42 (number)
-```
-
----
-
 ## Configuration
 
-You can configure the client globally.
-
 ```javascript
-import { configure } from "rqlink";
+import { configure } from 'rqlink';
 
 configure({
-  baseUrl: "http://192.168.1.50", // rqlite node address
-  timeout: 5000, // Request timeout in ms
-  verbose: true // Log all SQL queries to console
+  timeout: 5000,         // Request timeout in ms (default: 5000)
+  verbose: true,         // Log SQL queries in development
+  freshness: "0.1s",     // Freshness for read consistency
+  freshness_strict: true,// Strict freshness checking
+  retryDelay: 50,        // Base delay between retries in ms
+  maxRequestSize: 1024 * 1024, // Max request payload (1MB)
+  requireTLS: false      // Require HTTPS (set true for PHI/EMR)
 });
 ```
 
----
+## Security Features
 
-## Author
+Rqlink includes multiple layers of protection against SQL injection and other attacks:
 
-Created and maintained by: **Manwil Bahaa Zaki**
-- Email: [manwilbahaa@gmail.com](mailto:manwilbahaa@gmail.com)
-- LinkedIn: [linkedin.com/in/manwil](https://linkedin.com/in/manwil)
+### Parameterized Queries
+All user values are passed as named parameters, never interpolated into SQL strings.
 
-## Disclaimer
+### Math Expression Validation
+The `math` update operator validates expressions against:
+- Character whitelist (alphanumeric, arithmetic operators, parentheses)
+- SQL keyword blocklist (DROP, SELECT, UNION, INSERT, DELETE, etc.)
+- Comment pattern detection (`--`, `/*`, `*/`)
 
-**LIMITATION OF LIABILITY**: I, as the developer, am not responsible for any security vulnerabilities, data loss, or damages arising from the use of this software. This package is maintained to the best of my knowledge and is open for improvement. Use at your own risk.
+```javascript
+// ✅ Safe - uses parameterized arguments
+await db.users.update({
+  where: { id: 1 },
+  data: { balance: { math: '"balance" * :mult + :bonus', args: { mult: 2, bonus: 50 } } }
+});
+
+// ❌ Blocked - contains SQL keyword
+await db.users.update({
+  where: { id: 1 },
+  data: { balance: { math: 'SELECT * FROM users' } } // Throws error
+});
+```
+
+### Schema Validation
+- Table and column names restricted to `[a-zA-Z0-9_]+`
+- Column types validated against SQLite types
+- Default values sanitized
+
+### Request Size Limits
+Configurable `maxRequestSize` prevents DoS via large payloads (default: 1MB).
+
+### TLS Enforcement
+Enable `requireTLS: true` for PHI/EMR environments to block non-HTTPS connections.
+
+## Query Operators
+
+| Operator      | Description                    | Example                              |
+|---------------|--------------------------------|--------------------------------------|
+| `equals`      | Exact match                    | `{ id: { equals: 1 } }`              |
+| `not`         | Not equal                      | `{ status: { not: "deleted" } }`     |
+| `gt`          | Greater than                   | `{ age: { gt: 18 } }`                |
+| `gte`         | Greater than or equal          | `{ age: { gte: 18 } }`               |
+| `lt`          | Less than                      | `{ price: { lt: 100 } }`             |
+| `lte`         | Less than or equal             | `{ price: { lte: 100 } }`            |
+| `contains`    | LIKE %value%                   | `{ name: { contains: "john" } }`     |
+| `startsWith`  | LIKE value%                    | `{ email: { startsWith: "admin" } }` |
+| `endsWith`    | LIKE %value                    | `{ email: { endsWith: ".com" } }`    |
+| `in`          | IN (values)                    | `{ status: { in: ["a", "b"] } }`     |
+| `OR`          | Logical OR                     | `{ OR: [{ a: 1 }, { b: 2 }] }`       |
+| `NOT`         | Logical NOT                    | `{ NOT: { status: "deleted" } }`     |
+
+## Update Operators
+
+| Operator      | Description                    | Example                              |
+|---------------|--------------------------------|--------------------------------------|
+| `increment`   | Add to current value           | `{ balance: { increment: 50 } }`     |
+| `math`        | Custom math expression         | `{ balance: { math: '"balance" * :x', args: { x: 2 } } }` |
+
+## Consistency Levels
+
+Use `level` parameter for read operations:
+
+```javascript
+// Strong consistency (reads from leader)
+await db.users.findMany({ level: "strong" });
+
+// Default: freshness-based consistency
+await db.users.findMany(); // Uses configured freshness
+```
+
+## Schema Cache
+
+Rqlink caches table schema information for 5 minutes (configurable) to reduce PRAGMA calls. The cache:
+- Automatically expires after TTL
+- Is invalidated on schema changes (ALTER TABLE)
+- Has a size limit of 100 entries to prevent memory leaks
+
+## License
+
+MIT

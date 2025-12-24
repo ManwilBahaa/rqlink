@@ -2,7 +2,7 @@ node_modules
 .env
 .DS_Store
 *.log
-test_*.js
+test*.js
 schema.js
 index.js
 *.txt
